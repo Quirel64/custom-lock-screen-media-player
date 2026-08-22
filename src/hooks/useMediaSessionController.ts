@@ -1,9 +1,9 @@
 import { useEffect, useRef } from "react";
-import type { SkipMode } from "../lib/types";
 
-export type { SkipMode };
+export type SkipMode = "skip10" | "prevnext" | "both";
 
 interface Options {
+  /** Live getter for the current source-of-truth media element. */
   getMediaEl: () => HTMLMediaElement | null;
   title: string;
   artist: string;
@@ -18,29 +18,32 @@ interface Options {
   onPrevTrack: () => void;
   onNextTrack: () => void;
   log: (msg: string) => void;
+  /** Optional: re-bind position-state updates when the underlying element changes. */
+  mediaEpoch?: number | string;
 }
 
 /**
- * Registers Media Session action handlers. Which ones we register is what
- * decides the iOS lock-screen chrome:
+ * Wires the Media Session API.
  *
- *   skip10   -> seekbackward / seekforward  => round ±10 buttons
- *   prevnext -> previoustrack / nexttrack   => << >> chevrons
- *   both     -> everything (ambiguous / the bug in the original repo)
+ * The `mode` prop controls which handlers iOS uses to decide the lock-screen skin:
+ *  - "skip10"   -> seekbackward/seekforward  => round ±Ns arrows + interactive seek bar
+ *  - "prevnext" -> previoustrack/nexttrack   => plain chevrons, seek bar often non-interactive
+ *  - "both"     -> all four (ambiguous / version-dependent)
  *
- * Handlers always call through a ref so they never go stale, and they always
- * talk to the persistent <audio> via getMediaEl() — never a render-time snapshot.
+ * Handlers are registered once and call into stable refs, so they keep working even
+ * after the page has been backgrounded and the React tree has re-rendered.
  */
 export function useMediaSessionController(options: Options) {
   const optionsRef = useRef(options);
   optionsRef.current = options;
 
+  // Metadata whenever track info changes.
   useEffect(() => {
     if (!("mediaSession" in navigator)) return;
     navigator.mediaSession.metadata = new MediaMetadata({
       title: options.title || "Untitled",
       artist: options.artist || "Local file",
-      album: options.album || "Lock Screen Test",
+      album: options.album || "iOS Lock Screen Test",
       artwork: options.artworkUrl
         ? [
             { src: options.artworkUrl, sizes: "512x512", type: "image/png" },
@@ -50,16 +53,17 @@ export function useMediaSessionController(options: Options) {
     });
   }, [options.title, options.artist, options.album, options.artworkUrl]);
 
+  // Action handlers - depend only on mode / skipSeconds. Callbacks are read from the ref.
   useEffect(() => {
     if (!("mediaSession" in navigator)) return;
     const ms = navigator.mediaSession;
-    const log = optionsRef.current.log;
+    const log = (msg: string) => optionsRef.current.log(msg);
 
     const safeSet = (action: MediaSessionAction, handler: MediaSessionActionHandler | null) => {
       try {
         ms.setActionHandler(action, handler);
       } catch {
-        /* unsupported action on this OS */
+        /* some actions unsupported */
       }
     };
 
@@ -94,6 +98,7 @@ export function useMediaSessionController(options: Options) {
       safeSet("seekbackward", null);
       safeSet("seekforward", null);
     };
+
     const registerPrevNext = () => {
       safeSet("previoustrack", () => {
         log("mediaSession: previoustrack");
@@ -116,6 +121,7 @@ export function useMediaSessionController(options: Options) {
       unregisterSkip();
       registerPrevNext();
     } else {
+      // both
       registerSkip();
       registerPrevNext();
     }
@@ -130,4 +136,92 @@ export function useMediaSessionController(options: Options) {
       unregisterPrevNext();
     };
   }, [options.mode, options.skipSeconds]);
+
+  // Keep playbackState + position state in sync with the live element.
+  useEffect(() => {
+    if (!("mediaSession" in navigator)) return;
+
+    let disposed = false;
+    let attached: HTMLMediaElement | null = null;
+    let lastUpdate = 0;
+
+    const updatePositionState = (media: HTMLMediaElement) => {
+      if (!Number.isFinite(media.duration) || media.duration <= 0) return;
+      try {
+        navigator.mediaSession.setPositionState({
+          duration: media.duration,
+          playbackRate: media.playbackRate || 1,
+          position: Math.min(media.currentTime, media.duration),
+        });
+      } catch {
+        /* ignore */
+      }
+    };
+
+    const updatePlaybackState = (media: HTMLMediaElement) => {
+      navigator.mediaSession.playbackState = media.paused ? "paused" : "playing";
+    };
+
+    const onTimeUpdate = () => {
+      if (!attached) return;
+      const now = performance.now();
+      if (now - lastUpdate > 1000) {
+        lastUpdate = now;
+        updatePositionState(attached);
+      }
+    };
+
+    const detach = () => {
+      if (!attached) return;
+      attached.removeEventListener("loadedmetadata", onMeta);
+      attached.removeEventListener("durationchange", onMeta);
+      attached.removeEventListener("play", onPlay);
+      attached.removeEventListener("pause", onPause);
+      attached.removeEventListener("seeked", onMeta);
+      attached.removeEventListener("timeupdate", onTimeUpdate);
+      attached = null;
+    };
+
+    const onMeta = () => {
+      if (attached) updatePositionState(attached);
+    };
+    const onPlay = () => {
+      if (attached) {
+        updatePlaybackState(attached);
+        updatePositionState(attached);
+      }
+    };
+    const onPause = () => {
+      if (attached) updatePlaybackState(attached);
+    };
+
+    const attach = (media: HTMLMediaElement) => {
+      detach();
+      attached = media;
+      media.addEventListener("loadedmetadata", onMeta);
+      media.addEventListener("durationchange", onMeta);
+      media.addEventListener("play", onPlay);
+      media.addEventListener("pause", onPause);
+      media.addEventListener("seeked", onMeta);
+      media.addEventListener("timeupdate", onTimeUpdate);
+      updatePositionState(media);
+      updatePlaybackState(media);
+    };
+
+    // Poll for the live element because it is created/destroyed imperatively.
+    const poll = () => {
+      if (disposed) return;
+      const el = optionsRef.current.getMediaEl();
+      if (el && el !== attached) attach(el);
+      if (!el && attached) detach();
+      timer = window.setTimeout(poll, 400);
+    };
+    let timer = window.setTimeout(poll, 0);
+
+    return () => {
+      disposed = true;
+      window.clearTimeout(timer);
+      detach();
+    };
+  }, [options.mediaEpoch, options.mode]);
 }

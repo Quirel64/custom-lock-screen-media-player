@@ -1,401 +1,569 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { createSilentWavUrl, describeSilentWav } from "../lib/silentAudio";
-import { delay, setPlaybackAudioSession } from "../lib/audioSession";
-import {
-  createTrack,
-  type AnchorMode,
-  type PlaylistTrack,
-  type RepeatMode,
-  type SessionOwner,
-  type SessionStyle,
-} from "../lib/types";
+import { createSilentWavBlob } from "../lib/silentAudio";
 
-function hideOffscreen(el: HTMLElement) {
-  el.style.position = "fixed";
-  el.style.left = "-8px";
-  el.style.top = "-8px";
-  el.style.width = "1px";
-  el.style.height = "1px";
-  el.style.opacity = "0";
-  el.style.pointerEvents = "none";
+export interface Track {
+  id: string;
+  file: File;
+  url: string;
+  name: string;
+  mediaType: "audio" | "video";
 }
 
-function publishPosition(duration: number, position: number, playbackRate: number) {
-  if (!("mediaSession" in navigator)) return;
-  if (!Number.isFinite(duration) || duration <= 0) return;
-  const pos = Math.min(Math.max(0, position), duration);
+export type ElementMode = "dual" | "video-only" | "audio-only";
+
+/**
+ * Who currently "owns" the Media Session / iOS lock-screen seek bar.
+ *  - "track"  : real media is playing; setPositionState reports the track
+ *  - "anchor" : real media is paused; silent duration-matched audio is playing
+ *               at the frozen track position to keep the iOS audio session alive
+ *  - "none"   : idle (no track, or fully stopped)
+ */
+export type SessionOwner = "track" | "anchor" | "none";
+
+interface MediaDiagnostics {
+  owner: SessionOwner;
+  trackPaused: boolean | null;
+  anchorPaused: boolean | null;
+  trackTime: number | null;
+  anchorTime: number | null;
+  frozenPosition: number;
+}
+
+interface EngineOptions {
+  elementMode: ElementMode;
+  handoffEnabled: boolean;
+  log: (msg: string) => void;
+}
+
+function setAudioSessionType() {
   try {
-    navigator.mediaSession.setPositionState({ duration, playbackRate, position: pos });
+    const audioSession = (navigator as unknown as { audioSession?: { type: string } }).audioSession;
+    if (audioSession) audioSession.type = "playback";
   } catch {
-    if (playbackRate === 0) {
-      try {
-        navigator.mediaSession.setPositionState({ duration, playbackRate: 1, position: pos });
-      } catch {
-        /* iOS can throw if the session isn't ready */
-      }
-    }
+    /* ignore */
+  }
+}
+
+function hideOffscreen(el: HTMLElement) {
+  Object.assign(el.style, {
+    position: "fixed",
+    left: "-2px",
+    top: "-2px",
+    width: "1px",
+    height: "1px",
+    opacity: "0",
+    pointerEvents: "none",
+  });
+}
+
+function updatePositionState(el: HTMLMediaElement, forcedPosition?: number) {
+  if (!("mediaSession" in navigator)) return;
+  if (!Number.isFinite(el.duration) || el.duration <= 0) return;
+  const position = forcedPosition ?? el.currentTime;
+  try {
+    navigator.mediaSession.setPositionState({
+      duration: el.duration,
+      playbackRate: el.playbackRate || 1,
+      position: Math.min(Math.max(0, position), el.duration),
+    });
+  } catch {
+    /* iOS can throw if called too early */
   }
 }
 
 /**
- * Handoff playback engine.
+ * iOS-hardened playback engine with exclusive silent-anchor handoff.
  *
- * Only ONE element is allowed to be playing at a time:
- *   - User playing  → the real track plays, silent placeholder is paused
- *   - User paused   → the real track is paused, a silent WAV of the SAME
- *                     duration is seeked to the same currentTime and plays
- *                     (rewinding 1s every 1s so the seek bar stays put)
- *   - Resume        → placeholder pauses, track plays from the frozen time
+ * Problem this solves
+ * -------------------
+ * iOS kills background media sessions shortly after the only playing <audio>/<video>
+ * is paused. A looping silent <audio> keeps the session alive, BUT if it plays at the
+ * same time as the real track, iOS merges both into the lock-screen seek bar and the
+ * bar snaps between the two positions / durations.
  *
- * That is the only way to keep the iOS audio session alive through pause
- * without the lock-screen seek bar snapping between two different durations.
+ * Solution: exclusive ownership (handoff)
+ * --------------------------------------
+ *  PLAYING  -> track owns the session. Anchor is fully paused + has no src (or is
+ *              paused at the same position). setPositionState only ever reports the
+ *              track. No snap.
+ *  PAUSED   -> track pauses. Anchor is loaded with a silence WAV whose *duration
+ *              matches the track*, its currentTime is snapped to the track's paused
+ *              position, then it starts playing (near-silent). While it plays we
+ *              pin its currentTime every animation frame so the seek bar stays
+ *              frozen at the paused position. setPositionState reports the frozen
+ *              track position with playbackRate 0 (or 1 on the frozen anchor —
+ *              both work; we use the track's duration + frozen position).
+ *  RESUME   -> anchor pauses (and we stop pinning). Track resumes from the frozen
+ *              position. Ownership flips back.
+ *
+ * The "rewind 1s every second" idea is covered by the pin loop: every frame we
+ * force anchor.currentTime = frozenPosition, which is stronger and smoother than
+ * a 1 Hz rewind.
  */
-export function usePlaybackEngine() {
-  const audioRef = useRef<HTMLAudioElement | null>(null);
-  const videoRef = useRef<HTMLVideoElement | null>(null);
-  const silentRef = useRef<HTMLAudioElement | null>(null);
-  const videoContainerRef = useRef<HTMLDivElement | null>(null);
-  const silentUrlRef = useRef<string>("");
-  const silentDurationRef = useRef(0);
-  const frozenPosRef = useRef(0);
-  const ownerRef = useRef<SessionOwner>("idle");
-  const handoffLockRef = useRef(false);
-  const ignoreTrackPauseRef = useRef(false);
-  const ignoreSilentPauseRef = useRef(false);
-  const rafRef = useRef(0);
-
-  const tracksRef = useRef<PlaylistTrack[]>([]);
-  const indexRef = useRef(0);
-  const repeatRef = useRef<RepeatMode>("all");
-  const styleRef = useRef<SessionStyle>("audio-only");
-  const anchorModeRef = useRef<AnchorMode>("handoff");
-  const pendingPlayRef = useRef(false);
-  const durationRef = useRef(0);
-
-  const [tracks, setTracks] = useState<PlaylistTrack[]>([]);
+export function usePlaybackEngine({ elementMode, handoffEnabled, log }: EngineOptions) {
+  const [tracks, setTracks] = useState<Track[]>([]);
   const [currentIndex, setCurrentIndex] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
-  const [repeatMode, setRepeatMode] = useState<RepeatMode>("all");
-  const [sessionStyle, setSessionStyle] = useState<SessionStyle>("audio-only");
-  const [anchorMode, setAnchorMode] = useState<AnchorMode>("handoff");
-  const [sessionOwner, setSessionOwner] = useState<SessionOwner>("idle");
-  const [anchorTime, setAnchorTime] = useState(0);
-  const [anchorDuration, setAnchorDuration] = useState(0);
-  const [logs, setLogs] = useState<string[]>([]);
+  const [sessionOwner, setSessionOwner] = useState<SessionOwner>("none");
 
+  const mediaRef = useRef<HTMLAudioElement | null>(null);
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const anchorRef = useRef<HTMLAudioElement | null>(null);
+  const videoContainerRef = useRef<HTMLDivElement | null>(null);
+
+  const rafSyncRef = useRef(0);
+  const rafPinRef = useRef(0);
+  const frozenPositionRef = useRef(0);
+  const frozenDurationRef = useRef(0);
+  const anchorUrlRef = useRef<string | null>(null);
+  const anchorDurationBuiltRef = useRef(0);
+  const pendingPlayRef = useRef(false);
+  const handoffEnabledRef = useRef(handoffEnabled);
+  const elementModeRef = useRef(elementMode);
+  const logRef = useRef(log);
+  const tracksRef = useRef(tracks);
+  const currentIndexRef = useRef(currentIndex);
+  const isPlayingRef = useRef(isPlaying);
+  const sessionOwnerRef = useRef<SessionOwner>("none");
+  const loadGenRef = useRef(0);
+
+  handoffEnabledRef.current = handoffEnabled;
+  elementModeRef.current = elementMode;
+  logRef.current = log;
   tracksRef.current = tracks;
-  indexRef.current = currentIndex;
-  repeatRef.current = repeatMode;
-  styleRef.current = sessionStyle;
-  anchorModeRef.current = anchorMode;
-  durationRef.current = duration;
+  currentIndexRef.current = currentIndex;
+  isPlayingRef.current = isPlaying;
+  sessionOwnerRef.current = sessionOwner;
 
-  const log = useCallback((msg: string) => {
-    const time = new Date().toLocaleTimeString();
-    setLogs((prev) => [...prev.slice(-249), `[${time}] ${msg}`]);
-  }, []);
+  const currentTrack = tracks[currentIndex] ?? null;
 
-  const setOwner = useCallback((owner: SessionOwner) => {
-    ownerRef.current = owner;
-    setSessionOwner(owner);
-  }, []);
-
-  const getAudio = useCallback(() => audioRef.current, []);
-
-  const stopRaf = useCallback(() => {
-    if (rafRef.current) {
-      cancelAnimationFrame(rafRef.current);
-      rafRef.current = 0;
-    }
-  }, []);
-
-  const startVideoFrames = useCallback(() => {
-    stopRaf();
-    const tick = () => {
-      const audio = audioRef.current;
-      const video = videoRef.current;
-      if (audio && video && video.src && ownerRef.current === "track" && !audio.paused) {
-        try {
-          if (Math.abs(video.currentTime - audio.currentTime) > 0.08) {
-            video.currentTime = audio.currentTime;
-          }
-        } catch {
-          /* seek-before-ready */
-        }
-        rafRef.current = requestAnimationFrame(tick);
-      }
+  const getDiagnostics = useCallback((): MediaDiagnostics => {
+    const track = mediaRef.current;
+    const anchor = anchorRef.current;
+    return {
+      owner: sessionOwnerRef.current,
+      trackPaused: track ? track.paused : null,
+      anchorPaused: anchor ? anchor.paused : null,
+      trackTime: track ? track.currentTime : null,
+      anchorTime: anchor ? anchor.currentTime : null,
+      frozenPosition: frozenPositionRef.current,
     };
-    rafRef.current = requestAnimationFrame(tick);
-  }, [stopRaf]);
-
-  const snapSilent = useCallback((position: number) => {
-    const silent = silentRef.current;
-    if (!silent || !Number.isFinite(silent.duration) || silent.duration <= 0) return 0;
-    // Leave 1.2s of headroom so the 1-second rewind window never hits `ended`.
-    const max = Math.max(0, silent.duration - 1.2);
-    const pos = Math.min(Math.max(0, position), max);
-    try {
-      silent.currentTime = pos;
-    } catch {
-      /* ignore */
-    }
-    return pos;
   }, []);
 
-  const ensureAnchorDuration = useCallback(
-    async (trackDuration: number) => {
-      const silent = silentRef.current;
-      if (!silent) return;
-      const target = Math.max(2, Number.isFinite(trackDuration) ? trackDuration : 2);
-      if (silent.src && Math.abs(silentDurationRef.current - target) < 0.2) return;
+  // ---------- low-level helpers ----------
 
-      log(`building silent placeholder ${describeSilentWav(target)}`);
-      const url = createSilentWavUrl(target);
-      if (silentUrlRef.current) URL.revokeObjectURL(silentUrlRef.current);
-      silentUrlRef.current = url;
-      silent.loop = false;
-      silent.src = url;
-      silent.load();
+  const stopSyncRaf = () => {
+    if (rafSyncRef.current) {
+      cancelAnimationFrame(rafSyncRef.current);
+      rafSyncRef.current = 0;
+    }
+  };
 
-      await new Promise<void>((resolve) => {
-        const done = () => {
-          silent.removeEventListener("loadedmetadata", done);
-          resolve();
-        };
-        silent.addEventListener("loadedmetadata", done);
-        window.setTimeout(done, 800);
-      });
+  const stopPinRaf = () => {
+    if (rafPinRef.current) {
+      cancelAnimationFrame(rafPinRef.current);
+      rafPinRef.current = 0;
+    }
+  };
 
-      silentDurationRef.current = silent.duration || target;
-      setAnchorDuration(silentDurationRef.current);
-      log(
-        `placeholder ready ${silentDurationRef.current.toFixed(2)}s (track ${target.toFixed(2)}s)`
-      );
-    },
-    [log]
-  );
+  const pinAnchorToFrozenPosition = useCallback((reason: string) => {
+    const anchor = anchorRef.current;
+    if (!anchor || sessionOwnerRef.current !== "anchor") return;
 
-  const stopSilent = useCallback(() => {
-    const silent = silentRef.current;
-    if (!silent) return;
-    ignoreSilentPauseRef.current = true;
-    silent.pause();
-    window.setTimeout(() => {
-      ignoreSilentPauseRef.current = false;
-    }, 50);
+    const target = frozenPositionRef.current;
+    const maxPos =
+      Number.isFinite(anchor.duration) && anchor.duration > 0
+        ? Math.max(0, anchor.duration - 0.05)
+        : target;
+    const clamped = Math.max(0, Math.min(target, maxPos));
+
+    if (Math.abs(anchor.currentTime - clamped) > 0.03) {
+      try {
+        anchor.currentTime = clamped;
+      } catch {
+        /* ignore */
+      }
+    }
+
+    // The MediaSession position is intentionally the frozen *track* position,
+    // not the anchor's advancing currentTime.
+    if (Number.isFinite(frozenDurationRef.current) && frozenDurationRef.current > 0) {
+      try {
+        navigator.mediaSession?.setPositionState({
+          duration: frozenDurationRef.current,
+          playbackRate: 1,
+          position: Math.min(target, frozenDurationRef.current),
+        });
+      } catch {
+        /* ignore */
+      }
+    }
+
+    // Keep this log rare; the event log is useful on iOS and too much spam hurts.
+    if (reason === "remote-seek") {
+      logRef.current(`anchor pinned via ${reason} @ ${clamped.toFixed(1)}s`);
+    }
   }, []);
 
-  const play = useCallback(async () => {
-    const audio = audioRef.current;
-    if (!audio) {
-      log("play() aborted — audio element missing");
-      return;
-    }
-    if (!audio.src) {
-      const fallback = tracksRef.current[indexRef.current];
-      if (!fallback) {
-        log("play() aborted — playlist is empty");
-        return;
-      }
-      audio.src = fallback.url;
-      audio.load();
-      pendingPlayRef.current = true;
-      log("play() had no src — loaded current track, waiting for canplay");
-      return;
-    }
-
-    if (handoffLockRef.current) return;
-    handoffLockRef.current = true;
-
-    try {
-      setPlaybackAudioSession();
-
-      // HANDOFF: placeholder must be fully stopped before the track starts,
-      // otherwise iOS reports both durations on the lock-screen seek bar.
-      if (anchorModeRef.current !== "always-on") {
-        stopSilent();
-      }
-      if (ownerRef.current === "anchor") {
-        try {
-          audio.currentTime = frozenPosRef.current;
-        } catch {
-          /* ignore */
-        }
-      }
-
-      const startTrack = async () => {
-        await audio.play();
-        // Video is display-only (paused, seek-framed). Playing it as well is
-        // what used to make iOS treat this as a video session.
-        const video = videoRef.current;
-        if (video && video.src) {
+  const startVideoSync = useCallback(() => {
+    stopSyncRaf();
+    const tick = () => {
+      const audio = mediaRef.current;
+      const video = videoRef.current;
+      if (audio && video && !audio.paused) {
+        const diff = Math.abs(video.currentTime - audio.currentTime);
+        if (diff > 0.12) {
           try {
-            video.pause();
             video.currentTime = audio.currentTime;
           } catch {
             /* ignore */
           }
         }
-      };
-
-      try {
-        if (audio.readyState < 2) {
-          pendingPlayRef.current = true;
-          audio.load();
-          log("play() waiting for canplay");
-          return;
-        }
-        await startTrack();
-      } catch (err) {
-        log(`play() rejected: ${err} — retrying in 150ms`);
-        await delay(150);
-        setPlaybackAudioSession();
-        try {
-          await startTrack();
-        } catch (err2) {
-          setIsPlaying(false);
-          if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "paused";
-          log(`play() retry failed: ${err2}`);
-          return;
-        }
+        if (video.paused) video.play().catch(() => {});
       }
-
-      pendingPlayRef.current = false;
-      setOwner("track");
-      setIsPlaying(true);
-      if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "playing";
-      publishPosition(audio.duration, audio.currentTime, 1);
-      startVideoFrames();
-
-      if (anchorModeRef.current === "always-on") {
-        try {
-          await silentRef.current?.play();
-        } catch (err) {
-          log(`always-on placeholder play() rejected: ${err}`);
-        }
+      if (mediaRef.current && !mediaRef.current.paused) {
+        rafSyncRef.current = requestAnimationFrame(tick);
       }
+    };
+    rafSyncRef.current = requestAnimationFrame(tick);
+  }, []);
 
-      log("play() → track owns session");
-    } finally {
-      handoffLockRef.current = false;
-    }
-  }, [log, setOwner, startVideoFrames, stopSilent]);
+  /**
+   * Build (or rebuild) the silent anchor so its reported duration matches `targetDuration`.
+   * Reuses the existing blob when the duration hasn't meaningfully changed.
+   */
+  const ensureAnchorDuration = useCallback(async (targetDuration: number) => {
+    const anchor = anchorRef.current;
+    if (!anchor) return;
+    const safe = Math.max(1, Number.isFinite(targetDuration) ? targetDuration : 2);
 
-  const pause = useCallback(async () => {
-    const audio = audioRef.current;
-    if (!audio) return;
-    if (handoffLockRef.current) return;
-    handoffLockRef.current = true;
-
-    try {
-      const pos = audio.currentTime;
-      frozenPosRef.current = pos;
-
-      ignoreTrackPauseRef.current = true;
-      audio.pause();
-      videoRef.current?.pause();
-      stopRaf();
-      window.setTimeout(() => {
-        ignoreTrackPauseRef.current = false;
-      }, 50);
-
-      setIsPlaying(false);
-      setCurrentTime(pos);
-      if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "paused";
-      publishPosition(durationRef.current || audio.duration, pos, 0);
-
-      const mode = anchorModeRef.current;
-      if (mode === "off") {
-        setOwner("idle");
-        stopSilent();
-        log(`pause() → idle (anchor off) @ ${pos.toFixed(2)}s`);
-        return;
-      }
-
-      if (mode === "always-on") {
-        // Placeholder is already playing; just freeze our reported position.
-        setOwner("anchor");
-        log(`pause() → always-on placeholder keeps running @ ${pos.toFixed(2)}s`);
-        return;
-      }
-
-      // HANDOFF: track is stopped, placeholder of the same length takes over
-      // at the same playhead so iOS doesn't see a 2s duration or a jump.
-      await ensureAnchorDuration(durationRef.current || audio.duration || 2);
-      const silent = silentRef.current;
-      if (!silent) {
-        setOwner("idle");
-        return;
-      }
-      const snapped = snapSilent(pos);
-      frozenPosRef.current = snapped;
-      setPlaybackAudioSession();
-      try {
-        await silent.play();
-        setOwner("anchor");
-        log(`pause() → placeholder hold @ ${snapped.toFixed(2)}s / ${silent.duration.toFixed(2)}s`);
-      } catch (err) {
-        setOwner("idle");
-        log(`placeholder play() rejected on pause: ${err}`);
-      }
-      publishPosition(durationRef.current || silent.duration, snapped, 0);
-    } finally {
-      handoffLockRef.current = false;
-    }
-  }, [ensureAnchorDuration, log, setOwner, snapSilent, stopRaf, stopSilent]);
-
-  const togglePlay = useCallback(() => {
-    const audio = audioRef.current;
-    if (!audio || !audio.src) {
-      log("togglePlay ignored — nothing loaded");
+    // Rebuild only if duration drifted by more than half a second.
+    if (
+      anchorUrlRef.current &&
+      Math.abs(anchorDurationBuiltRef.current - safe) < 0.5 &&
+      Number.isFinite(anchor.duration) &&
+      anchor.duration > 0
+    ) {
       return;
     }
-    if (ownerRef.current === "track" && !audio.paused) {
-      void pause();
-    } else {
-      void play();
+
+    if (anchorUrlRef.current) {
+      URL.revokeObjectURL(anchorUrlRef.current);
+      anchorUrlRef.current = null;
     }
-  }, [play, pause, log]);
+
+    const blob = createSilentWavBlob(safe);
+    const url = URL.createObjectURL(blob);
+    anchorUrlRef.current = url;
+    anchorDurationBuiltRef.current = safe;
+
+    await new Promise<void>((resolve) => {
+      const onMeta = () => {
+        anchor.removeEventListener("loadedmetadata", onMeta);
+        resolve();
+      };
+      anchor.addEventListener("loadedmetadata", onMeta);
+      anchor.src = url;
+      anchor.load();
+      // Safety timeout so we never hang if metadata never fires.
+      setTimeout(() => {
+        anchor.removeEventListener("loadedmetadata", onMeta);
+        resolve();
+      }, 500);
+    });
+
+    logRef.current(
+      `anchor rebuilt: target=${safe.toFixed(1)}s actual=${
+        Number.isFinite(anchor.duration) ? anchor.duration.toFixed(1) : "?"
+      }s`
+    );
+  }, []);
+
+  /**
+   * Hand session ownership to the silent anchor, frozen at the track's current position.
+   * Called on pause (and whenever we need the session kept alive without the track playing).
+   */
+  const handoffToAnchor = useCallback(async () => {
+    if (!handoffEnabledRef.current) return;
+    const track = mediaRef.current;
+    const anchor = anchorRef.current;
+    if (!track || !anchor) return;
+
+    const pos = Number.isFinite(track.currentTime) ? track.currentTime : 0;
+    const dur =
+      Number.isFinite(track.duration) && track.duration > 0
+        ? track.duration
+        : frozenDurationRef.current || 2;
+
+    frozenPositionRef.current = pos;
+    frozenDurationRef.current = dur;
+
+    await ensureAnchorDuration(dur);
+
+    // Snap anchor to the exact paused position of the track.
+    try {
+      // Clamp in case the generated WAV is slightly shorter than the real track.
+      const maxPos = Number.isFinite(anchor.duration) && anchor.duration > 0 ? anchor.duration - 0.05 : pos;
+      anchor.currentTime = Math.max(0, Math.min(pos, maxPos));
+    } catch {
+      /* ignore */
+    }
+
+    setAudioSessionType();
+    try {
+      await anchor.play();
+    } catch (err) {
+      logRef.current(`anchor.play() failed: ${String(err)}`);
+      // Retry once — same stale-session pattern as the real track.
+      await new Promise((r) => setTimeout(r, 100));
+      try {
+        setAudioSessionType();
+        await anchor.play();
+      } catch (err2) {
+        logRef.current(`anchor.play() retry failed: ${String(err2)}`);
+        return;
+      }
+    }
+
+    // Slow the anchor as much as the engine allows. If iOS honors this, the
+    // lock-screen clock barely moves. If it ignores it, the timeupdate handler
+    // below still snaps it back whenever Safari lets JS run.
+    try {
+      anchor.playbackRate = 0.0001;
+    } catch {
+      try {
+        anchor.playbackRate = 0.0625;
+      } catch {
+        /* ignore */
+      }
+    }
+
+    // Pin the anchor's currentTime while the app is foregrounded. On the lock
+    // screen iOS pauses requestAnimationFrame, so we also pin from the anchor's
+    // own timeupdate event (registered on mount below).
+    stopPinRaf();
+    const pin = () => {
+      const a = anchorRef.current;
+      if (!a || a.paused || sessionOwnerRef.current !== "anchor") return;
+      pinAnchorToFrozenPosition("raf");
+      rafPinRef.current = requestAnimationFrame(pin);
+    };
+    rafPinRef.current = requestAnimationFrame(pin);
+
+    setSessionOwner("anchor");
+    sessionOwnerRef.current = "anchor";
+    if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "playing";
+    logRef.current(
+      `handoff -> ANCHOR @ ${pos.toFixed(1)}s / ${dur.toFixed(1)}s (session kept alive)`
+    );
+  }, [ensureAnchorDuration, pinAnchorToFrozenPosition]);
+
+  /**
+   * Hand session ownership back to the real track. Stops the anchor completely
+   * so it cannot compete for the seek bar.
+   */
+  const handoffToTrack = useCallback(() => {
+    const anchor = anchorRef.current;
+    stopPinRaf();
+    if (anchor) {
+      anchor.pause();
+      // Hard-release the anchor on resume. Leaving the source attached can make
+      // iOS keep treating it as the active lock-screen item in standalone PWAs.
+      anchor.removeAttribute("src");
+      anchor.load();
+      if (anchorUrlRef.current) {
+        URL.revokeObjectURL(anchorUrlRef.current);
+        anchorUrlRef.current = null;
+      }
+      anchorDurationBuiltRef.current = 0;
+    }
+    setSessionOwner("track");
+    sessionOwnerRef.current = "track";
+    logRef.current("handoff -> TRACK (anchor paused)");
+  }, []);
+
+  // ---------- public actions ----------
+
+  const play = useCallback(async () => {
+    const el = mediaRef.current;
+    if (!el || !el.src) {
+      logRef.current("play() aborted: no media");
+      return;
+    }
+
+    if (sessionOwnerRef.current === "anchor") {
+      try {
+        el.currentTime = frozenPositionRef.current;
+      } catch {
+        /* ignore */
+      }
+      logRef.current(
+        `resume requested from anchor @ ${frozenPositionRef.current.toFixed(1)}s`
+      );
+    }
+
+    // Exclusive handoff: stop the anchor BEFORE starting the track so iOS
+    // never sees two playing elements at once.
+    handoffToTrack();
+    setAudioSessionType();
+
+    try {
+      await el.play();
+    } catch (err) {
+      logRef.current(`play() rejected, retrying: ${String(err)}`);
+      await new Promise((r) => setTimeout(r, 120));
+      try {
+        setAudioSessionType();
+        await el.play();
+      } catch (err2) {
+        logRef.current(`play() retry failed: ${String(err2)}`);
+        setIsPlaying(false);
+        if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "paused";
+        // Fall back to anchor so the session still stays alive.
+        void handoffToAnchor();
+        return;
+      }
+    }
+
+    if (videoRef.current && videoRef.current.src) {
+      try {
+        videoRef.current.currentTime = el.currentTime;
+        videoRef.current.play().catch(() => {});
+      } catch {
+        /* ignore */
+      }
+      startVideoSync();
+    }
+
+    setIsPlaying(true);
+    if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "playing";
+    updatePositionState(el);
+    logRef.current(`play() succeeded @ ${el.currentTime.toFixed(1)}s`);
+  }, [handoffToTrack, handoffToAnchor, startVideoSync]);
+
+  const pause = useCallback(() => {
+    const el = mediaRef.current;
+    if (!el) return;
+
+    // Capture position BEFORE pausing so the freeze point is exact.
+    frozenPositionRef.current = el.currentTime;
+    if (Number.isFinite(el.duration) && el.duration > 0) {
+      frozenDurationRef.current = el.duration;
+    }
+
+    el.pause();
+    videoRef.current?.pause();
+    stopSyncRaf();
+
+    setIsPlaying(false);
+    if ("mediaSession" in navigator) {
+      navigator.mediaSession.playbackState = "paused";
+      updatePositionState(el, frozenPositionRef.current);
+    }
+
+    // Hand the live session over to the duration-matched silent anchor.
+    void handoffToAnchor();
+    logRef.current(`pause() @ ${frozenPositionRef.current.toFixed(1)}s`);
+  }, [handoffToAnchor]);
+
+  const togglePlay = useCallback(() => {
+    const el = mediaRef.current;
+    if (!el) return;
+    if (sessionOwnerRef.current === "anchor") {
+      logRef.current("togglePlay: anchor owns session -> resume track");
+      void play();
+      return;
+    }
+    // Prefer real element state — React state can desync after lock-screen actions.
+    if (el.paused) void play();
+    else pause();
+  }, [play, pause]);
+
+  const remotePauseOrResume = useCallback(() => {
+    const owner = sessionOwnerRef.current;
+    const anchor = anchorRef.current;
+    const track = mediaRef.current;
+
+    // This is the key iOS quirk from your latest test: because the anchor is
+    // actually playing while the user-facing track is paused, iOS displays a
+    // pause button and fires the MediaSession "pause" action. In that state,
+    // "pause" from the lock screen really means "the user is pressing the
+    // center transport button to get back to the real track", so we resume.
+    if (owner === "anchor" || (track?.paused && anchor && !anchor.paused)) {
+      logRef.current(
+        `remote pause while anchor active -> resume track (trackPaused=${String(
+          track?.paused
+        )}, anchorPaused=${String(anchor?.paused)})`
+      );
+      void play();
+      return;
+    }
+
+    logRef.current("remote pause -> pause track");
+    pause();
+  }, [play, pause]);
 
   const seek = useCallback(
     (time: number) => {
-      const audio = audioRef.current;
-      if (!audio) return;
-      const max = Number.isFinite(audio.duration) ? audio.duration : time;
+      const el = mediaRef.current;
+      if (!el) return;
+      const max = Number.isFinite(el.duration) ? el.duration : time;
       const clamped = Math.max(0, Math.min(time, max));
-      audio.currentTime = clamped;
-      frozenPosRef.current = clamped;
-      if (videoRef.current && videoRef.current.src) {
+      el.currentTime = clamped;
+      if (videoRef.current) {
         try {
           videoRef.current.currentTime = clamped;
         } catch {
           /* ignore */
         }
       }
-      if (ownerRef.current === "anchor") {
-        snapSilent(clamped);
-      }
       setCurrentTime(clamped);
-      publishPosition(
-        durationRef.current || audio.duration,
-        clamped,
-        ownerRef.current === "track" ? 1 : 0
-      );
+      frozenPositionRef.current = clamped;
+
+      // If the anchor currently owns the session, keep it pinned to the new position
+      // so a scrub-while-paused doesn't jump the lock-screen bar.
+      if (sessionOwnerRef.current === "anchor" && anchorRef.current) {
+        try {
+          const a = anchorRef.current;
+          const maxPos =
+            Number.isFinite(a.duration) && a.duration > 0 ? a.duration - 0.05 : clamped;
+          a.currentTime = Math.max(0, Math.min(clamped, maxPos));
+        } catch {
+          /* ignore */
+        }
+        if (Number.isFinite(frozenDurationRef.current) && frozenDurationRef.current > 0) {
+          try {
+            navigator.mediaSession?.setPositionState({
+              duration: frozenDurationRef.current,
+              playbackRate: 1,
+              position: clamped,
+            });
+          } catch {
+            /* ignore */
+          }
+        }
+      } else {
+        updatePositionState(el, clamped);
+      }
     },
-    [snapSilent]
+    []
   );
 
   const seekRelative = useCallback(
     (delta: number) => {
-      const audio = audioRef.current;
-      if (!audio) return;
-      const base = ownerRef.current === "anchor" ? frozenPosRef.current : audio.currentTime;
+      const el = mediaRef.current;
+      if (!el) return;
+      // When paused (anchor owns session), seek relative to the frozen position.
+      const base =
+        sessionOwnerRef.current === "anchor" ? frozenPositionRef.current : el.currentTime;
       seek(base + delta);
     },
     [seek]
   );
+
+  // ---------- track loading ----------
 
   const attachVideo = useCallback((url: string) => {
     const container = videoContainerRef.current;
@@ -403,217 +571,139 @@ export function usePlaybackEngine() {
     if (!video) {
       video = document.createElement("video");
       video.muted = true;
+      video.defaultMuted = true;
       video.playsInline = true;
       video.setAttribute("webkit-playsinline", "true");
       video.setAttribute("playsinline", "true");
       video.preload = "auto";
       video.controls = false;
-      video.style.width = "100%";
-      video.style.height = "100%";
-      video.style.objectFit = "contain";
-      video.style.background = "#000";
+      Object.assign(video.style, {
+        width: "100%",
+        height: "100%",
+        objectFit: "contain",
+        borderRadius: "12px",
+        touchAction: "manipulation",
+        background: "#000",
+      });
       videoRef.current = video;
     }
     if (container && video.parentNode !== container) {
       container.innerHTML = "";
       container.appendChild(video);
     }
-    if (video.src !== url) {
+    if (video.getAttribute("src") !== url) {
       video.src = url;
       video.load();
     }
-    video.pause();
   }, []);
 
   const detachVideo = useCallback(() => {
-    const video = videoRef.current;
-    if (!video) return;
-    video.pause();
-    video.removeAttribute("src");
-    video.load();
+    if (videoRef.current) {
+      const v = videoRef.current;
+      v.pause();
+      v.removeAttribute("src");
+      v.load();
+      if (v.parentNode) v.parentNode.removeChild(v);
+      videoRef.current = null;
+    }
   }, []);
 
-  const loadIndex = useCallback(
-    (index: number, autoplay: boolean) => {
+  const loadTrack = useCallback(
+    async (index: number, autoplay: boolean) => {
       const list = tracksRef.current;
-      if (list.length === 0) return;
-      const nextIndex = ((index % list.length) + list.length) % list.length;
-      const track = list[nextIndex];
-      const audio = audioRef.current;
-      if (!audio || !track) return;
+      const track = list[index];
+      const el = mediaRef.current;
+      if (!track || !el) {
+        if (el) {
+          el.removeAttribute("src");
+          el.load();
+        }
+        detachVideo();
+        stopPinRaf();
+        anchorRef.current?.pause();
+        setIsPlaying(false);
+        setCurrentTime(0);
+        setDuration(0);
+        setSessionOwner("none");
+        return;
+      }
 
-      stopSilent();
-      stopRaf();
-      setOwner("idle");
-
-      indexRef.current = nextIndex;
-      setCurrentIndex(nextIndex);
+      const gen = ++loadGenRef.current;
+      stopSyncRaf();
+      stopPinRaf();
+      anchorRef.current?.pause();
+      setSessionOwner("none");
       setCurrentTime(0);
       setDuration(0);
-      durationRef.current = 0;
-      frozenPosRef.current = 0;
 
+      const mode = elementModeRef.current;
       pendingPlayRef.current = autoplay;
-      audio.src = track.url;
-      audio.load();
 
-      if (styleRef.current === "dual") {
+      el.src = track.url;
+      el.load();
+
+      if (mode === "dual" || (mode === "video-only" && track.mediaType === "video")) {
+        attachVideo(track.url);
+      } else if (mode === "video-only") {
+        // audio file in video-only mode: still attach so lock screen gets video UI
         attachVideo(track.url);
       } else {
         detachVideo();
       }
 
-      log(
-        `loaded [${nextIndex + 1}/${list.length}] ${track.name}${autoplay ? " (will autoplay)" : ""}`
+      if ("mediaSession" in navigator) {
+        navigator.mediaSession.metadata = new MediaMetadata({
+          title: track.name,
+          artist: "Lock Screen Test Player",
+          album: track.mediaType === "video" ? "Video track" : "Audio track",
+        });
+      }
+
+      setAudioSessionType();
+      logRef.current(
+        `loadTrack [${index + 1}/${list.length}] ${track.name} (mode=${mode}, autoplay=${autoplay})`
       );
 
-      if (autoplay && audio.readyState >= 2) {
-        void play();
-      }
-    },
-    [attachVideo, detachVideo, play, log, setOwner, stopRaf, stopSilent]
-  );
-
-  const goToTrack = useCallback(
-    (index: number) => {
-      const shouldPlay = pendingPlayRef.current || ownerRef.current === "track";
-      loadIndex(index, shouldPlay);
-    },
-    [loadIndex]
-  );
-
-  const nextTrack = useCallback(() => {
-    const list = tracksRef.current;
-    if (list.length === 0) return;
-    const current = indexRef.current;
-    if (repeatRef.current === "one") {
-      seek(0);
-      void play();
-      return;
-    }
-    if (current >= list.length - 1) {
-      if (repeatRef.current === "all") {
-        loadIndex(0, true);
-      } else {
-        void pause();
-        seek(0);
-        log("end of playlist");
-      }
-      return;
-    }
-    loadIndex(current + 1, true);
-  }, [loadIndex, pause, play, seek, log]);
-
-  const prevTrack = useCallback(() => {
-    const audio = audioRef.current;
-    const pos = ownerRef.current === "anchor" ? frozenPosRef.current : audio?.currentTime ?? 0;
-    if (pos > 3) {
-      seek(0);
-      return;
-    }
-    const list = tracksRef.current;
-    if (list.length === 0) return;
-    const shouldPlay = ownerRef.current === "track";
-    const current = indexRef.current;
-    if (current <= 0) {
-      if (repeatRef.current === "all") {
-        loadIndex(list.length - 1, shouldPlay);
-      } else {
-        seek(0);
-      }
-      return;
-    }
-    loadIndex(current - 1, shouldPlay);
-  }, [loadIndex, seek]);
-
-  const addFiles = useCallback(
-    (fileList: FileList | File[] | null) => {
-      if (!fileList) return;
-      const files = Array.from(fileList).filter(
-        (f) =>
-          f.type.startsWith("audio/") ||
-          f.type.startsWith("video/") ||
-          /\.(mp4|m4a|mp3|wav|aac|mov|m4v|webm|ogg|flac)$/i.test(f.name)
-      );
-      if (files.length === 0) {
-        log("no audio/video files in selection");
-        return;
-      }
-      const created = files.map(createTrack);
-      const wasEmpty = tracksRef.current.length === 0;
-      const next = [...tracksRef.current, ...created];
-      tracksRef.current = next;
-      setTracks(next);
-      log(`added ${created.length} track(s): ${created.map((t) => t.name).join(", ")}`);
-      if (wasEmpty) loadIndex(0, false);
-    },
-    [loadIndex, log]
-  );
-
-  const removeTrack = useCallback(
-    (id: string) => {
-      const prev = tracksRef.current;
-      const idx = prev.findIndex((t) => t.id === id);
-      if (idx < 0) return;
-      URL.revokeObjectURL(prev[idx].url);
-      const next = prev.filter((t) => t.id !== id);
-      tracksRef.current = next;
-      setTracks(next);
-      const current = indexRef.current;
-      if (next.length === 0) {
-        stopSilent();
-        const audio = audioRef.current;
-        if (audio) {
-          audio.pause();
-          audio.removeAttribute("src");
-          audio.load();
+      // Wait for metadata so we can pre-build a duration-matched anchor.
+      const waitMeta = new Promise<void>((resolve) => {
+        if (Number.isFinite(el.duration) && el.duration > 0) {
+          resolve();
+          return;
         }
-        detachVideo();
-        setIsPlaying(false);
-        setOwner("idle");
-        setCurrentIndex(0);
-        setCurrentTime(0);
-        setDuration(0);
-        return;
+        const done = () => {
+          el.removeEventListener("loadedmetadata", done);
+          resolve();
+        };
+        el.addEventListener("loadedmetadata", done);
+        setTimeout(() => {
+          el.removeEventListener("loadedmetadata", done);
+          resolve();
+        }, 2000);
+      });
+      await waitMeta;
+      if (gen !== loadGenRef.current) return;
+
+      if (Number.isFinite(el.duration) && el.duration > 0) {
+        setDuration(el.duration);
+        frozenDurationRef.current = el.duration;
+        updatePositionState(el);
+        // Pre-build the matching silent anchor so pause handoff is instant.
+        await ensureAnchorDuration(el.duration);
       }
-      if (idx === current) {
-        loadIndex(Math.min(current, next.length - 1), ownerRef.current === "track");
-      } else if (idx < current) {
-        const newIndex = current - 1;
-        indexRef.current = newIndex;
-        setCurrentIndex(newIndex);
+
+      if (gen !== loadGenRef.current) return;
+      if (pendingPlayRef.current) {
+        pendingPlayRef.current = false;
+        await play();
       }
     },
-    [detachVideo, loadIndex, setOwner, stopSilent]
+    [attachVideo, detachVideo, ensureAnchorDuration, play]
   );
 
-  const clearPlaylist = useCallback(() => {
-    tracksRef.current.forEach((t) => URL.revokeObjectURL(t.url));
-    tracksRef.current = [];
-    setTracks([]);
-    indexRef.current = 0;
-    setCurrentIndex(0);
-    setCurrentTime(0);
-    setDuration(0);
-    setIsPlaying(false);
-    setOwner("idle");
-    stopSilent();
-    const audio = audioRef.current;
-    if (audio) {
-      audio.pause();
-      audio.removeAttribute("src");
-      audio.load();
-    }
-    detachVideo();
-    log("playlist cleared");
-  }, [detachVideo, log, setOwner, stopSilent]);
+  // ---------- mount persistent elements once ----------
 
-  const cycleRepeat = useCallback(() => {
-    setRepeatMode((prev) => (prev === "off" ? "all" : prev === "all" ? "one" : "off"));
-  }, []);
-
-  // Persistent elements.
   useEffect(() => {
+    // Real track element (source of truth).
     const audio = document.createElement("audio");
     audio.preload = "auto";
     audio.controls = false;
@@ -622,212 +712,372 @@ export function usePlaybackEngine() {
     audio.setAttribute("x-webkit-airplay", "allow");
     hideOffscreen(audio);
     document.body.appendChild(audio);
-    audioRef.current = audio;
+    mediaRef.current = audio;
 
-    const silent = document.createElement("audio");
-    silent.preload = "auto";
-    silent.volume = 0.001; // not muted — iOS ignores muted elements for session-keep
-    silent.setAttribute("playsinline", "true");
-    silent.setAttribute("data-silent", "true");
-    hideOffscreen(silent);
-    document.body.appendChild(silent);
-    silentRef.current = silent;
+    // Silent anchor — src is set lazily to a duration-matched WAV on first pause/load.
+    const anchor = document.createElement("audio");
+    anchor.preload = "auto";
+    anchor.loop = true;
+    anchor.volume = 0.001; // near-silent; some iOS builds ignore volume=0 looping audio
+    anchor.setAttribute("playsinline", "true");
+    anchor.setAttribute("data-silent-anchor", "true");
+    hideOffscreen(anchor);
+    document.body.appendChild(anchor);
+    anchorRef.current = anchor;
 
-    const onTime = () => {
-      if (ownerRef.current !== "track") return;
-      setCurrentTime(audio.currentTime);
-      publishPosition(audio.duration, audio.currentTime, 1);
+    const onAnchorTimeUpdate = () => {
+      // requestAnimationFrame is suspended on the lock screen, but media
+      // timeupdate events can still fire for the actively playing anchor.
+      // This is our background-safe correction path.
+      pinAnchorToFrozenPosition("timeupdate");
     };
-    const onLoaded = () => {
-      const d = audio.duration;
-      if (Number.isFinite(d) && d > 0) {
-        setDuration(d);
-        durationRef.current = d;
-        publishPosition(d, audio.currentTime, ownerRef.current === "track" ? 1 : 0);
-        // Pre-build the matching placeholder so pause handoff is instant.
-        if (anchorModeRef.current !== "off") {
-          void ensureAnchorDuration(d);
+    const onAnchorPlay = () => {
+      if (sessionOwnerRef.current === "anchor") {
+        try {
+          anchor.playbackRate = 0.0001;
+        } catch {
+          /* ignore */
         }
+        pinAnchorToFrozenPosition("anchor-play");
+      }
+    };
+    const onAnchorPause = () => {
+      if (sessionOwnerRef.current === "anchor") {
+        logRef.current("anchor pause event while owner=anchor");
+      }
+    };
+    anchor.addEventListener("timeupdate", onAnchorTimeUpdate);
+    anchor.addEventListener("play", onAnchorPlay);
+    anchor.addEventListener("pause", onAnchorPause);
+
+    const onTimeUpdate = () => {
+      if (mediaRef.current !== audio) return;
+      // Only drive UI time from the track while the track owns the session.
+      // When the anchor owns it, the UI stays frozen at frozenPositionRef.
+      if (sessionOwnerRef.current !== "anchor") {
+        setCurrentTime(audio.currentTime);
+        updatePositionState(audio);
+      }
+    };
+    const onLoadedMetadata = () => {
+      if (mediaRef.current !== audio) return;
+      if (Number.isFinite(audio.duration) && audio.duration > 0) {
+        setDuration(audio.duration);
+        frozenDurationRef.current = audio.duration;
+        updatePositionState(audio);
       }
     };
     const onPlay = () => {
-      if (ignoreTrackPauseRef.current) return;
+      if (mediaRef.current !== audio) return;
       setIsPlaying(true);
-      if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "playing";
+      setSessionOwner("track");
+      if ("mediaSession" in navigator) {
+        navigator.mediaSession.playbackState = "playing";
+        updatePositionState(audio);
+      }
+      if (videoRef.current?.src) {
+        try {
+          videoRef.current.currentTime = audio.currentTime;
+          videoRef.current.play().catch(() => {});
+        } catch {
+          /* ignore */
+        }
+        startVideoSync();
+      }
+      logRef.current("track play event");
     };
     const onPause = () => {
-      if (ignoreTrackPauseRef.current) return;
-      // An unexpected pause while we still want the track (iOS backgrounding a
-      // video session, etc.) — if the user is in "playing" state, try to resume.
+      if (mediaRef.current !== audio) return;
+      // Ignore spurious pause events fired by iOS while backgrounding if we
+      // still intend to be playing (the visibility handler manages that case).
+      if (document.visibilityState === "visible" || audio.ended) {
+        setIsPlaying(false);
+        if ("mediaSession" in navigator) {
+          navigator.mediaSession.playbackState = "paused";
+          updatePositionState(audio);
+        }
+        stopSyncRaf();
+        logRef.current("track pause event");
+      } else {
+        logRef.current("track pause event ignored (background/spurious)");
+      }
     };
     const onEnded = () => {
-      if (ownerRef.current !== "track") return;
-      log("track ended");
-      const mode = repeatRef.current;
-      const list = tracksRef.current;
-      const idx = indexRef.current;
-      if (mode === "one") {
-        audio.currentTime = 0;
-        void play();
-        return;
-      }
-      if (idx < list.length - 1) {
-        loadIndex(idx + 1, true);
-        return;
-      }
-      if (mode === "all" && list.length > 0) {
-        loadIndex(0, true);
-        return;
-      }
-      void pause();
-    };
-    const onCanPlay = () => {
-      if (pendingPlayRef.current) {
-        pendingPlayRef.current = false;
-        void play();
-      }
+      if (mediaRef.current !== audio) return;
+      logRef.current("track ended");
+      window.dispatchEvent(new CustomEvent("playback-ended"));
     };
     const onError = () => {
-      const err = audio.error;
-      log(`audio error ${err?.code ?? "?"}: ${err?.message ?? "unknown"}`);
+      if (mediaRef.current !== audio) return;
+      logRef.current("track media error");
+      setIsPlaying(false);
+    };
+    const onSeeked = () => {
+      if (mediaRef.current === audio) updatePositionState(audio);
     };
 
-    // Placeholder: rewind 1s after ~1s of playback so the playhead stays frozen
-    // at the paused position. This is what keeps the lock-screen seek bar still.
-    const onSilentTime = () => {
-      setAnchorTime(silent.currentTime);
-      if (ownerRef.current !== "anchor") return;
-      const frozen = frozenPosRef.current;
-      if (silent.currentTime - frozen >= 1) {
-        snapSilent(frozen);
-        log(`placeholder rewind → ${frozen.toFixed(2)}s`);
-      }
-      publishPosition(durationRef.current || silent.duration, frozen, 0);
-    };
-    const onSilentEnded = () => {
-      if (ownerRef.current !== "anchor") return;
-      snapSilent(frozenPosRef.current);
-      silent.play().catch(() => {});
-    };
-    const onSilentPause = () => {
-      if (ignoreSilentPauseRef.current) return;
-      if (ownerRef.current === "anchor" && anchorModeRef.current === "handoff") {
-        // iOS paused our placeholder (lock-screen pause tap). Keep the session
-        // alive by starting it again — the user-facing state is already paused.
-        setPlaybackAudioSession();
-        silent.play().catch(() => {});
-      }
-    };
-
-    audio.addEventListener("timeupdate", onTime);
-    audio.addEventListener("loadedmetadata", onLoaded);
-    audio.addEventListener("durationchange", onLoaded);
+    audio.addEventListener("timeupdate", onTimeUpdate);
+    audio.addEventListener("loadedmetadata", onLoadedMetadata);
+    audio.addEventListener("durationchange", onLoadedMetadata);
     audio.addEventListener("play", onPlay);
     audio.addEventListener("pause", onPause);
     audio.addEventListener("ended", onEnded);
-    audio.addEventListener("canplay", onCanPlay);
     audio.addEventListener("error", onError);
-    audio.addEventListener("seeked", () => {
-      if (ownerRef.current === "track") {
-        publishPosition(audio.duration, audio.currentTime, 1);
-      }
-    });
+    audio.addEventListener("seeked", onSeeked);
 
-    silent.addEventListener("timeupdate", onSilentTime);
-    silent.addEventListener("ended", onSilentEnded);
-    silent.addEventListener("pause", onSilentPause);
-
-    setPlaybackAudioSession();
-    log("engine ready — handoff placeholder (duration-matched, exclusive owner)");
+    setAudioSessionType();
 
     return () => {
-      stopRaf();
+      audio.removeEventListener("timeupdate", onTimeUpdate);
+      audio.removeEventListener("loadedmetadata", onLoadedMetadata);
+      audio.removeEventListener("durationchange", onLoadedMetadata);
+      audio.removeEventListener("play", onPlay);
+      audio.removeEventListener("pause", onPause);
+      audio.removeEventListener("ended", onEnded);
+      audio.removeEventListener("error", onError);
+      audio.removeEventListener("seeked", onSeeked);
+      anchor.removeEventListener("timeupdate", onAnchorTimeUpdate);
+      anchor.removeEventListener("play", onAnchorPlay);
+      anchor.removeEventListener("pause", onAnchorPause);
+      stopSyncRaf();
+      stopPinRaf();
       audio.pause();
       audio.removeAttribute("src");
       audio.load();
       audio.remove();
-      silent.pause();
-      silent.removeAttribute("src");
-      silent.load();
-      silent.remove();
-      if (silentUrlRef.current) URL.revokeObjectURL(silentUrlRef.current);
-      audioRef.current = null;
-      silentRef.current = null;
+      anchor.pause();
+      anchor.removeAttribute("src");
+      anchor.load();
+      anchor.remove();
+      if (anchorUrlRef.current) URL.revokeObjectURL(anchorUrlRef.current);
+      mediaRef.current = null;
+      anchorRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Load when index / list / mode changes.
   useEffect(() => {
-    const track = tracksRef.current[indexRef.current];
-    if (!track) return;
-    if (sessionStyle === "dual") attachVideo(track.url);
-    else detachVideo();
-  }, [sessionStyle, attachVideo, detachVideo]);
+    if (tracks.length === 0) {
+      const el = mediaRef.current;
+      if (el) {
+        el.pause();
+        el.removeAttribute("src");
+        el.load();
+      }
+      detachVideo();
+      stopPinRaf();
+      anchorRef.current?.pause();
+      setIsPlaying(false);
+      setCurrentTime(0);
+      setDuration(0);
+      setSessionOwner("none");
+      return;
+    }
+    const idx = Math.min(currentIndex, tracks.length - 1);
+    if (idx !== currentIndex) {
+      setCurrentIndex(idx);
+      return;
+    }
+    void loadTrack(idx, isPlayingRef.current);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentIndex, tracks, elementMode]);
 
+  // Auto-advance.
   useEffect(() => {
-    const onVis = () => {
-      log(`document.visibilityState -> ${document.visibilityState}`);
-      const audio = audioRef.current;
-      const silent = silentRef.current;
-      if (document.visibilityState === "hidden") {
+    const onEnded = () => {
+      const list = tracksRef.current;
+      const idx = currentIndexRef.current;
+      if (list.length === 0) return;
+      if (idx < list.length - 1) {
+        isPlayingRef.current = true;
+        setCurrentIndex(idx + 1);
+      } else {
+        setIsPlaying(false);
+        if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "paused";
+        // Keep session alive at end-of-playlist via anchor at the final position.
+        void handoffToAnchor();
+        logRef.current("Reached end of playlist");
+      }
+    };
+    window.addEventListener("playback-ended", onEnded);
+    return () => window.removeEventListener("playback-ended", onEnded);
+  }, [handoffToAnchor]);
+
+  // Foreground / background handling.
+  useEffect(() => {
+    const onVisibility = () => {
+      logRef.current(`document.visibilityState -> ${document.visibilityState}`);
+      if (document.visibilityState === "visible") {
+        const el = mediaRef.current;
+        if (el && isPlayingRef.current && el.paused && !el.ended) {
+          logRef.current("Foreground: track should be playing but is paused — resuming");
+          void play();
+        } else if (el && videoRef.current?.src && !el.paused) {
+          try {
+            videoRef.current.currentTime = el.currentTime;
+            videoRef.current.play().catch(() => {});
+          } catch {
+            /* ignore */
+          }
+          startVideoSync();
+        }
+      } else {
+        // Backgrounding: pause the muted video (saves battery) but leave the
+        // owning audio element (track OR anchor) running.
         videoRef.current?.pause();
-        stopRaf();
-        return;
-      }
-      // Back to foreground: restore whoever should own the session.
-      if (ownerRef.current === "track" && audio && audio.paused && !audio.ended) {
-        void play();
-      } else if (ownerRef.current === "anchor" && silent && silent.paused) {
-        silent.play().catch(() => {});
-      }
-      if (ownerRef.current === "track" && audio && !audio.paused) {
-        startVideoFrames();
+        stopSyncRaf();
       }
     };
-    document.addEventListener("visibilitychange", onVis);
-    return () => document.removeEventListener("visibilitychange", onVis);
-  }, [log, play, startVideoFrames, stopRaf]);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => document.removeEventListener("visibilitychange", onVisibility);
+  }, [play, startVideoSync]);
 
+  // If the user toggles handoff off while the anchor owns the session, release it.
   useEffect(() => {
-    return () => {
-      tracksRef.current.forEach((t) => URL.revokeObjectURL(t.url));
-    };
+    if (!handoffEnabled && sessionOwnerRef.current === "anchor") {
+      stopPinRaf();
+      anchorRef.current?.pause();
+      setSessionOwner("none");
+      logRef.current("handoff disabled — anchor released");
+    }
+  }, [handoffEnabled]);
+
+  // ---------- playlist API ----------
+
+  const addFiles = useCallback((fileList: FileList | File[]) => {
+    const arr = Array.from(fileList);
+    if (arr.length === 0) return;
+    const newTracks: Track[] = arr.map((file, i) => {
+      const isVideo =
+        file.type.startsWith("video/") || /\.(mp4|mov|webm|m4v)$/i.test(file.name);
+      return {
+        id: `${Date.now()}-${i}-${file.name}`,
+        file,
+        url: URL.createObjectURL(file),
+        name: file.name.replace(/\.[^.]+$/, "") || file.name,
+        mediaType: isVideo ? "video" : "audio",
+      };
+    });
+    setTracks((prev) => {
+      const next = [...prev, ...newTracks];
+      logRef.current(
+        `Added ${newTracks.length} track(s). Playlist now ${next.length}: ${next
+          .map((t) => t.name)
+          .join(", ")}`
+      );
+      return next;
+    });
   }, []);
 
-  const currentTrack = tracks[currentIndex] ?? null;
+  const removeTrack = useCallback((index: number) => {
+    setTracks((prev) => {
+      const removed = prev[index];
+      if (removed) URL.revokeObjectURL(removed.url);
+      const next = prev.filter((_, i) => i !== index);
+      logRef.current(`Removed track #${index + 1}. Playlist now ${next.length}`);
+      return next;
+    });
+    setCurrentIndex((prev) => {
+      if (index < prev) return prev - 1;
+      if (index === prev) return Math.max(0, Math.min(prev, Math.max(0, tracksRef.current.length - 2)));
+      return prev;
+    });
+  }, []);
+
+  const clearPlaylist = useCallback(() => {
+    setTracks((prev) => {
+      prev.forEach((t) => URL.revokeObjectURL(t.url));
+      return [];
+    });
+    setCurrentIndex(0);
+    const el = mediaRef.current;
+    if (el) {
+      el.pause();
+      el.removeAttribute("src");
+      el.load();
+    }
+    detachVideo();
+    stopPinRaf();
+    anchorRef.current?.pause();
+    setIsPlaying(false);
+    setCurrentTime(0);
+    setDuration(0);
+    setSessionOwner("none");
+    logRef.current("Playlist cleared");
+  }, [detachVideo]);
+
+  const goToTrack = useCallback((index: number) => {
+    const list = tracksRef.current;
+    if (list.length === 0) return;
+    const clamped = ((index % list.length) + list.length) % list.length;
+    if (mediaRef.current && !mediaRef.current.paused) {
+      isPlayingRef.current = true;
+    }
+    logRef.current(`goToTrack(${clamped}) -> ${list[clamped]?.name}`);
+    setCurrentIndex(clamped);
+  }, []);
+
+  const nextTrack = useCallback(() => {
+    const list = tracksRef.current;
+    if (list.length === 0) {
+      logRef.current("nextTrack: empty playlist");
+      return;
+    }
+    if (list.length === 1) {
+      seek(0);
+      void play();
+      logRef.current("nextTrack: only one track — restarted");
+      return;
+    }
+    goToTrack(currentIndexRef.current + 1);
+  }, [goToTrack, seek, play]);
+
+  const prevTrack = useCallback(() => {
+    const list = tracksRef.current;
+    if (list.length === 0) {
+      logRef.current("prevTrack: empty playlist");
+      return;
+    }
+    const el = mediaRef.current;
+    const pos =
+      sessionOwnerRef.current === "anchor"
+        ? frozenPositionRef.current
+        : el?.currentTime ?? 0;
+    if (pos > 3) {
+      seek(0);
+      logRef.current("prevTrack: restarted current track");
+      return;
+    }
+    if (list.length === 1) {
+      seek(0);
+      return;
+    }
+    goToTrack(currentIndexRef.current - 1);
+  }, [goToTrack, seek]);
 
   return {
     tracks,
-    currentTrack,
     currentIndex,
+    currentTrack,
     isPlaying,
     currentTime,
     duration,
-    repeatMode,
-    sessionStyle,
-    anchorMode,
     sessionOwner,
-    anchorTime,
-    anchorDuration,
-    frozenPosition: sessionOwner === "anchor" ? frozenPosRef.current : currentTime,
-    logs,
     videoContainerRef,
-    getAudio,
+    mediaRef,
+    getDiagnostics,
+    addFiles,
+    removeTrack,
+    clearPlaylist,
     play,
     pause,
+    remotePauseOrResume,
     togglePlay,
     seek,
     seekRelative,
     nextTrack,
     prevTrack,
     goToTrack,
-    addFiles,
-    removeTrack,
-    clearPlaylist,
-    cycleRepeat,
-    setSessionStyle,
-    setAnchorMode,
-    log,
-    clearLogs: () => setLogs([]),
   };
 }

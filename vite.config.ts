@@ -10,7 +10,6 @@ const __dirname = path.dirname(__filename);
 
 // https://vite.dev/config/
 export default defineConfig({
-  base: "/custom-lock-screen-media-player/",
   plugins: [react(), tailwindcss(), viteSingleFile()],
   resolve: {
     alias: {
