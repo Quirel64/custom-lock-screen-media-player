@@ -120,6 +120,8 @@ export function usePlaybackEngine({ elementMode, handoffEnabled, log }: EngineOp
   const anchorUrlRef = useRef<string | null>(null);
   const anchorDurationBuiltRef = useRef(0);
   const pendingPlayRef = useRef(false);
+  const suppressAnchorPauseResumeRef = useRef(false);
+  const lastResumeRequestRef = useRef(0);
   const handoffEnabledRef = useRef(handoffEnabled);
   const elementModeRef = useRef(elementMode);
   const logRef = useRef(log);
@@ -167,6 +169,14 @@ export function usePlaybackEngine({ elementMode, handoffEnabled, log }: EngineOp
       rafPinRef.current = 0;
     }
   };
+
+  const suppressNextAnchorPause = useCallback((reason: string) => {
+    suppressAnchorPauseResumeRef.current = true;
+    window.setTimeout(() => {
+      suppressAnchorPauseResumeRef.current = false;
+    }, 700);
+    logRef.current(`suppress anchor pause resume (${reason})`);
+  }, []);
 
   const pinAnchorToFrozenPosition = useCallback((reason: string) => {
     const anchor = anchorRef.current;
@@ -281,6 +291,52 @@ export function usePlaybackEngine({ elementMode, handoffEnabled, log }: EngineOp
     );
   }, []);
 
+  const armSession = useCallback(
+    async (reason = "manual") => {
+      const anchor = anchorRef.current;
+      const track = mediaRef.current;
+      if (!anchor) return false;
+
+      if (track && !track.paused) {
+        logRef.current(`armSession skipped (${reason}): track is already playing`);
+        return true;
+      }
+
+      const dur =
+        track && Number.isFinite(track.duration) && track.duration > 0
+          ? track.duration
+          : frozenDurationRef.current || 2;
+      const pos = Math.max(0, frozenPositionRef.current || 0);
+
+      try {
+        await ensureAnchorDuration(dur);
+        const maxPos =
+          Number.isFinite(anchor.duration) && anchor.duration > 0
+            ? Math.max(0, anchor.duration - 0.05)
+            : pos;
+        anchor.currentTime = Math.min(pos, maxPos);
+        try {
+          anchor.playbackRate = 0.0001;
+        } catch {
+          /* ignore */
+        }
+
+        setAudioSessionType();
+        await anchor.play();
+        await new Promise((r) => setTimeout(r, 90));
+        suppressNextAnchorPause(`arm-session-${reason}`);
+        anchor.pause();
+        anchor.currentTime = Math.min(pos, maxPos);
+        logRef.current(`iOS session armed (${reason})`);
+        return true;
+      } catch (err) {
+        logRef.current(`armSession failed (${reason}): ${String(err)}`);
+        return false;
+      }
+    },
+    [ensureAnchorDuration, suppressNextAnchorPause]
+  );
+
   /**
    * Hand session ownership to the silent anchor, frozen at the track's current position.
    * Called on pause (and whenever we need the session kept alive without the track playing).
@@ -368,6 +424,7 @@ export function usePlaybackEngine({ elementMode, handoffEnabled, log }: EngineOp
     const anchor = anchorRef.current;
     stopPinRaf();
     if (anchor) {
+      suppressNextAnchorPause("handoff-to-track");
       anchor.pause();
       // Hard-release the anchor on resume. Leaving the source attached can make
       // iOS keep treating it as the active lock-screen item in standalone PWAs.
@@ -382,7 +439,7 @@ export function usePlaybackEngine({ elementMode, handoffEnabled, log }: EngineOp
     setSessionOwner("track");
     sessionOwnerRef.current = "track";
     logRef.current("handoff -> TRACK (anchor paused)");
-  }, []);
+  }, [suppressNextAnchorPause]);
 
   // ---------- public actions ----------
 
@@ -443,6 +500,38 @@ export function usePlaybackEngine({ elementMode, handoffEnabled, log }: EngineOp
     logRef.current(`play() succeeded @ ${el.currentTime.toFixed(1)}s`);
   }, [handoffToTrack, handoffToAnchor, startVideoSync]);
 
+  const requestResumeFromAnchor = useCallback(
+    (source: string) => {
+      const now = Date.now();
+      if (now - lastResumeRequestRef.current < 650) {
+        logRef.current(`resume request ignored (${source}, already trying)`);
+        return;
+      }
+      lastResumeRequestRef.current = now;
+
+      logRef.current(`resume request from anchor via ${source}`);
+      void play();
+
+      // Standalone PWAs sometimes drop the first hidden play attempt even when
+      // it came from a remote media command. Retry while the command is still fresh.
+      window.setTimeout(() => {
+        const track = mediaRef.current;
+        if (sessionOwnerRef.current === "track" && track && track.paused && !track.ended) {
+          logRef.current("resume watchdog retry #1");
+          void play();
+        }
+      }, 450);
+      window.setTimeout(() => {
+        const track = mediaRef.current;
+        if (sessionOwnerRef.current === "track" && track && track.paused && !track.ended) {
+          logRef.current("resume watchdog retry #2");
+          void play();
+        }
+      }, 1200);
+    },
+    [play]
+  );
+
   const pause = useCallback(() => {
     const el = mediaRef.current;
     if (!el) return;
@@ -473,13 +562,13 @@ export function usePlaybackEngine({ elementMode, handoffEnabled, log }: EngineOp
     if (!el) return;
     if (sessionOwnerRef.current === "anchor") {
       logRef.current("togglePlay: anchor owns session -> resume track");
-      void play();
+      requestResumeFromAnchor("in-app-toggle");
       return;
     }
     // Prefer real element state — React state can desync after lock-screen actions.
     if (el.paused) void play();
     else pause();
-  }, [play, pause]);
+  }, [play, pause, requestResumeFromAnchor]);
 
   const remotePauseOrResume = useCallback(() => {
     const owner = sessionOwnerRef.current;
@@ -497,13 +586,13 @@ export function usePlaybackEngine({ elementMode, handoffEnabled, log }: EngineOp
           track?.paused
         )}, anchorPaused=${String(anchor?.paused)})`
       );
-      void play();
+      requestResumeFromAnchor("mediaSession-pause");
       return;
     }
 
     logRef.current("remote pause -> pause track");
     pause();
-  }, [play, pause]);
+  }, [requestResumeFromAnchor, pause]);
 
   const seek = useCallback(
     (time: number) => {
@@ -620,19 +709,23 @@ export function usePlaybackEngine({ elementMode, handoffEnabled, log }: EngineOp
         }
         detachVideo();
         stopPinRaf();
+        suppressNextAnchorPause("load-empty");
         anchorRef.current?.pause();
         setIsPlaying(false);
         setCurrentTime(0);
         setDuration(0);
         setSessionOwner("none");
+        sessionOwnerRef.current = "none";
         return;
       }
 
       const gen = ++loadGenRef.current;
       stopSyncRaf();
       stopPinRaf();
+      suppressNextAnchorPause("load-track");
       anchorRef.current?.pause();
       setSessionOwner("none");
+      sessionOwnerRef.current = "none";
       setCurrentTime(0);
       setDuration(0);
 
@@ -700,6 +793,35 @@ export function usePlaybackEngine({ elementMode, handoffEnabled, log }: EngineOp
     [attachVideo, detachVideo, ensureAnchorDuration, play]
   );
 
+  const recoverSession = useCallback(async () => {
+    const list = tracksRef.current;
+    const idx = currentIndexRef.current;
+    const track = list[idx];
+    logRef.current("recoverSession: rebuilding media elements and re-arming iOS session");
+
+    stopSyncRaf();
+    stopPinRaf();
+    suppressNextAnchorPause("recover-session");
+    if (anchorRef.current) {
+      anchorRef.current.pause();
+      anchorRef.current.removeAttribute("src");
+      anchorRef.current.load();
+    }
+    if (anchorUrlRef.current) {
+      URL.revokeObjectURL(anchorUrlRef.current);
+      anchorUrlRef.current = null;
+    }
+    anchorDurationBuiltRef.current = 0;
+    setIsPlaying(false);
+    setSessionOwner("none");
+    sessionOwnerRef.current = "none";
+
+    if (track) {
+      await loadTrack(idx, false);
+      await armSession("recover");
+    }
+  }, [armSession, loadTrack, suppressNextAnchorPause]);
+
   // ---------- mount persistent elements once ----------
 
   useEffect(() => {
@@ -743,7 +865,15 @@ export function usePlaybackEngine({ elementMode, handoffEnabled, log }: EngineOp
     };
     const onAnchorPause = () => {
       if (sessionOwnerRef.current === "anchor") {
-        logRef.current("anchor pause event while owner=anchor");
+        if (suppressAnchorPauseResumeRef.current) {
+          logRef.current("anchor pause event suppressed (programmatic)");
+          return;
+        }
+        // In Home Screen PWAs, iOS can pause the active anchor directly without
+        // delivering MediaSession's `pause` handler. Treat that native anchor
+        // pause event as the user's request to resume the real track.
+        logRef.current("anchor pause event from OS -> resume track");
+        requestResumeFromAnchor("anchor-pause-event");
       }
     };
     anchor.addEventListener("timeupdate", onAnchorTimeUpdate);
@@ -867,11 +997,13 @@ export function usePlaybackEngine({ elementMode, handoffEnabled, log }: EngineOp
       }
       detachVideo();
       stopPinRaf();
+      suppressNextAnchorPause("empty-playlist");
       anchorRef.current?.pause();
       setIsPlaying(false);
       setCurrentTime(0);
       setDuration(0);
       setSessionOwner("none");
+      sessionOwnerRef.current = "none";
       return;
     }
     const idx = Math.min(currentIndex, tracks.length - 1);
@@ -937,11 +1069,13 @@ export function usePlaybackEngine({ elementMode, handoffEnabled, log }: EngineOp
   useEffect(() => {
     if (!handoffEnabled && sessionOwnerRef.current === "anchor") {
       stopPinRaf();
+      suppressNextAnchorPause("handoff-disabled");
       anchorRef.current?.pause();
       setSessionOwner("none");
+      sessionOwnerRef.current = "none";
       logRef.current("handoff disabled — anchor released");
     }
-  }, [handoffEnabled]);
+  }, [handoffEnabled, suppressNextAnchorPause]);
 
   // ---------- playlist API ----------
 
@@ -968,7 +1102,10 @@ export function usePlaybackEngine({ elementMode, handoffEnabled, log }: EngineOp
       );
       return next;
     });
-  }, []);
+    // File selection is a trusted user gesture on iOS, so use it to unlock / warm
+    // the anchor element before the user goes to the lock screen.
+    void armSession("file-picker");
+  }, [armSession]);
 
   const removeTrack = useCallback((index: number) => {
     setTracks((prev) => {
@@ -999,13 +1136,15 @@ export function usePlaybackEngine({ elementMode, handoffEnabled, log }: EngineOp
     }
     detachVideo();
     stopPinRaf();
+    suppressNextAnchorPause("clear-playlist");
     anchorRef.current?.pause();
     setIsPlaying(false);
     setCurrentTime(0);
     setDuration(0);
     setSessionOwner("none");
+    sessionOwnerRef.current = "none";
     logRef.current("Playlist cleared");
-  }, [detachVideo]);
+  }, [detachVideo, suppressNextAnchorPause]);
 
   const goToTrack = useCallback((index: number) => {
     const list = tracksRef.current;
@@ -1070,6 +1209,8 @@ export function usePlaybackEngine({ elementMode, handoffEnabled, log }: EngineOp
     addFiles,
     removeTrack,
     clearPlaylist,
+    armSession,
+    recoverSession,
     play,
     pause,
     remotePauseOrResume,

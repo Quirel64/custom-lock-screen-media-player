@@ -71,6 +71,8 @@ export default function MediaTestPlayer() {
     addFiles,
     removeTrack,
     clearPlaylist,
+    armSession,
+    recoverSession,
     play,
     remotePauseOrResume,
     togglePlay,
@@ -216,15 +218,31 @@ export default function MediaTestPlayer() {
             <h2 className="text-sm font-semibold uppercase tracking-wide text-white/50">
               2. Playback
             </h2>
-            <button
-              onClick={toggleSkipVsTrackMode}
-              className="flex items-center gap-2 rounded-full bg-indigo-500 px-3 py-1.5 text-xs font-semibold text-white shadow-md shadow-indigo-500/30 transition hover:bg-indigo-400 active:scale-95"
-            >
-              <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="currentColor">
-                <path d="M7 7h11l-2.5-2.5L17 3l5 5-5 5-1.5-1.5L18 9H7a3 3 0 1 0 0 6h4v2H7a5 5 0 0 1 0-10Z" />
-              </svg>
-              {mode === "prevnext" ? "Switch to ±10s skip" : "Switch to Prev / Next track"}
-            </button>
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                onClick={() => void armSession("manual-button")}
+                className="rounded-full bg-white/10 px-3 py-1.5 text-xs font-semibold text-white/70 transition hover:bg-white/20 hover:text-white active:scale-95"
+                title="Warms the hidden audio anchor from a user gesture. Useful if standalone PWA controls start dead after reopening."
+              >
+                Arm iOS session
+              </button>
+              <button
+                onClick={() => void recoverSession()}
+                className="rounded-full bg-amber-500/20 px-3 py-1.5 text-xs font-semibold text-amber-200 ring-1 ring-amber-400/30 transition hover:bg-amber-500/30 active:scale-95"
+                title="Rebuilds the hidden media elements without force-closing the PWA."
+              >
+                Recover session
+              </button>
+              <button
+                onClick={toggleSkipVsTrackMode}
+                className="flex items-center gap-2 rounded-full bg-indigo-500 px-3 py-1.5 text-xs font-semibold text-white shadow-md shadow-indigo-500/30 transition hover:bg-indigo-400 active:scale-95"
+              >
+                <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="currentColor">
+                  <path d="M7 7h11l-2.5-2.5L17 3l5 5-5 5-1.5-1.5L18 9H7a3 3 0 1 0 0 6h4v2H7a5 5 0 0 1 0-10Z" />
+                </svg>
+                {mode === "prevnext" ? "Switch to ±10s skip" : "Switch to Prev / Next track"}
+              </button>
+            </div>
           </div>
 
           {/* Session owner badge — the key diagnostic for the handoff */}
