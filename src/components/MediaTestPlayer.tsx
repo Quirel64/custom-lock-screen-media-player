@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import { useMediaSessionController, type SkipMode } from "../hooks/useMediaSessionController";
 import { usePlaybackEngine, type ElementMode, type SessionOwner } from "../hooks/usePlaybackEngine";
+import { useSingleElementEngine } from "../hooks/useSingleElementEngine";
 import { generateArtwork } from "../lib/artwork";
 import { formatTime } from "../lib/format";
 import EventLog from "./EventLog";
@@ -33,17 +34,19 @@ const ELEMENT_INFO: Record<ElementMode, string> = {
     "A single <audio> element only. Background keep-alive is reliable, but iOS often draws a simpler lock-screen UI where the seek bar looks present but doesn't scrub.",
 };
 
-const OWNER_LABEL: Record<SessionOwner, { text: string; color: string }> = {
+const OWNER_LABEL: Record<SessionOwner | "frozen", { text: string; color: string }> = {
   track: { text: "TRACK owns session", color: "bg-emerald-500/20 text-emerald-300 ring-emerald-400/40" },
   anchor: { text: "ANCHOR owns session (paused keep-alive)", color: "bg-amber-500/20 text-amber-300 ring-amber-400/40" },
+  frozen: { text: "FROZEN single-element (plan 1)", color: "bg-sky-500/20 text-sky-300 ring-sky-400/40" },
   none: { text: "No session owner", color: "bg-white/10 text-white/40 ring-white/10" },
-};
+} as Record<string, { text: string; color: string }>;
 
 export default function MediaTestPlayer() {
   const [elementMode, setElementMode] = useState<ElementMode>("dual");
   const [mode, setMode] = useState<SkipMode>("skip10");
   const [skipSeconds, setSkipSeconds] = useState(10);
   const [handoffEnabled, setHandoffEnabled] = useState(true);
+  const [useSingleElement, setUseSingleElement] = useState(false);
   const [logs, setLogs] = useState<string[]>([]);
 
   const log = (msg: string) => {
@@ -51,11 +54,16 @@ export default function MediaTestPlayer() {
     setLogs((prev) => [...prev.slice(-199), `[${time}] ${msg}`]);
   };
 
-  const engine = usePlaybackEngine({
+  const anchorEngine = usePlaybackEngine({
     elementMode,
     handoffEnabled,
     log,
   });
+  const singleEngine = useSingleElementEngine({
+    elementMode,
+    log,
+  });
+  const engine = useSingleElement ? singleEngine : anchorEngine;
 
   const {
     tracks,
@@ -438,7 +446,7 @@ export default function MediaTestPlayer() {
             <label className="flex cursor-pointer items-start justify-between gap-3 rounded-lg bg-black/20 px-3 py-3">
               <span className="text-xs leading-relaxed text-white/60">
                 <span className="block font-medium text-white/80">
-                  Exclusive anchor handoff
+                  Exclusive anchor handoff {useSingleElement ? "(off — single-element test)" : ""}
                 </span>
                 When playing: only the track runs. On pause: a silent WAV whose{" "}
                 <em>duration matches the track</em> takes over at the frozen position and
@@ -448,8 +456,24 @@ export default function MediaTestPlayer() {
               <input
                 type="checkbox"
                 checked={handoffEnabled}
+                disabled={useSingleElement}
                 onChange={(e) => setHandoffEnabled(e.target.checked)}
-                className="mt-0.5 h-4 w-4 shrink-0 accent-emerald-400"
+                className="mt-0.5 h-4 w-4 shrink-0 accent-emerald-400 disabled:opacity-30"
+              />
+            </label>
+            <label className="flex cursor-pointer items-start justify-between gap-3 rounded-lg bg-sky-500/10 px-3 py-3 ring-1 ring-sky-400/30">
+              <span className="text-xs leading-relaxed text-white/60">
+                <span className="block font-medium text-sky-200">Plan 1: Single-element freeze (test)</span>
+                On pause: keep SAME element playing at 0.001 vol + 0.0001 rate, pin
+                <code className="text-sky-300"> currentTime = frozenPos</code> via
+                <code className="text-sky-300"> timeupdate</code>. No second element, no handoff.
+                On play: restore vol/rate. Tests if iOS keeps session without an anchor.
+              </span>
+              <input
+                type="checkbox"
+                checked={useSingleElement}
+                onChange={(e) => setUseSingleElement(e.target.checked)}
+                className="mt-0.5 h-4 w-4 shrink-0 accent-sky-400"
               />
             </label>
           </div>
