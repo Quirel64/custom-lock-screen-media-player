@@ -1,6 +1,9 @@
+import { useState } from "react";
 import MediaTestPlayer from "./components/MediaTestPlayer";
+import MediaTestPlayerArena from "./components/MediaTestPlayerArena";
 
 export default function App() {
+  const [useArena, setUseArena] = useState(false);
   return (
     <div className="min-h-screen bg-[#05070a] text-white">
       <div className="mx-auto max-w-6xl px-4 py-8 sm:px-6 lg:px-8">
@@ -13,14 +16,30 @@ export default function App() {
           </h1>
           <p className="mt-2 max-w-3xl text-sm text-white/60">
             Load an MP4 (video or audio), play it, then lock your phone or switch apps to
-            see what the real iOS lock screen draws. This build focuses on the{" "}
-            <strong className="text-white/80">exclusive silent-anchor handoff</strong> —
-            the fix for "pause then play doesn't resume" without the seek-bar snap you get
-            when a looping 2s WAV runs alongside the track.
+            see what the real iOS lock screen draws. Toggle below between{" "}
+            <strong className="text-white/80">anchor handoff / single-element freeze</strong> and{" "}
+            <strong className="text-sky-300">Arena same-element (silent WAV swap, HOLD_RATE 0.25)</strong> — Arena still uses a silent WAV but on the <em>same</em> permanent element, not two elements.
+          </p>
+          <div className="mt-4 flex gap-2">
+            <button
+              onClick={() => setUseArena(false)}
+              className={`rounded-full px-4 py-2 text-xs font-semibold ${!useArena ? "bg-emerald-500 text-white" : "bg-white/10 text-white/60 hover:bg-white/20"}`}
+            >
+              Anchor / Single (Plan 1)
+            </button>
+            <button
+              onClick={() => setUseArena(true)}
+              className={`rounded-full px-4 py-2 text-xs font-semibold ${useArena ? "bg-sky-500 text-white" : "bg-white/10 text-white/60 hover:bg-white/20"}`}
+            >
+              Arena same-element
+            </button>
+          </div>
+          <p className="mt-2 text-xs text-white/40">
+            Arena: one permanent &lt;audio&gt; swaps src track ↔ silent WAV (duration-matched), HOLD_RATE 0.25, queued transitions — fixes PWA cross-element play() AbortError. Our Plan 1 keeps same src and pins with volume 0.001.
           </p>
         </header>
 
-        <MediaTestPlayer />
+        {useArena ? <MediaTestPlayerArena /> : <MediaTestPlayer />}
 
         <footer className="mt-10 rounded-2xl border border-white/10 bg-white/5 p-5 text-sm leading-relaxed text-white/60">
           <h2 className="mb-2 text-sm font-semibold text-white/80">
