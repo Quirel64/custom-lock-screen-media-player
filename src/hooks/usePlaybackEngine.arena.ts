@@ -16,7 +16,7 @@ type Command = "play" | "pause";
 // Safari accepts this as real playback while keeping unavoidable anchor drift
 // small. Timers are not guaranteed while a standalone PWA is hidden, so
 // correctness cannot depend on the rewind firing.
-const HOLD_RATE = 0.000001;
+const HOLD_RATE = 0.01;
 
 function hideOffscreen(el: HTMLElement) {
   el.style.position = "fixed";
