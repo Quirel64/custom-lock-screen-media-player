@@ -203,6 +203,24 @@ export function useFreezeEngine({ elementMode, videoSyncMode, log }: EngineOptio
         /* ignore */
       }
     }
+    // Keep video locked to same frozen frame — rAF is throttled on lock screen,
+    // but this runs whenever JS does get a tick (timeupdate + rAF). Without this
+    // the muted video keeps playing and you return to find video ahead of audio.
+    const v = videoRef.current;
+    if (v && !v.paused) {
+      try {
+        v.pause();
+      } catch {
+        /* ignore */
+      }
+    }
+    if (v && Math.abs(v.currentTime - target) > 0.06) {
+      try {
+        v.currentTime = target;
+      } catch {
+        /* ignore */
+      }
+    }
     publishFrozen();
   }, [publishFrozen]);
 
@@ -257,15 +275,17 @@ export function useFreezeEngine({ elementMode, videoSyncMode, log }: EngineOptio
     let v = videoRef.current;
     if (!v) {
       v = document.createElement("video");
-      // These five together are what keep the <video> from ever becoming the
-      // Now Playing / lock-screen session owner. Never unmute this element —
-      // volume lives on the <audio>.
+      // Delist video from WebKit media session so it never owns Now Playing.
+      // All of these together are needed — muted alone is not enough on PWA.
+      // Never unmute this element — volume lives on the <audio>.
       v.muted = true;
-      v.defaultMuted = true;
+      (v as unknown as { defaultMuted: boolean }).defaultMuted = true;
+      v.setAttribute("muted", "");
       v.playsInline = true;
       v.setAttribute("webkit-playsinline", "true");
       v.setAttribute("playsinline", "true");
       v.setAttribute("x-webkit-airplay", "deny");
+      v.setAttribute("controlsList", "nodownload nofullscreen noremoteplayback");
       try {
         (v as unknown as { disableRemotePlayback: boolean }).disableRemotePlayback = true;
       } catch {
@@ -273,6 +293,7 @@ export function useFreezeEngine({ elementMode, videoSyncMode, log }: EngineOptio
       }
       try {
         (v as unknown as { disablePictureInPicture: boolean }).disablePictureInPicture = true;
+        v.setAttribute("disablePictureInPicture", "");
       } catch {
         /* ignore */
       }
@@ -286,6 +307,26 @@ export function useFreezeEngine({ elementMode, videoSyncMode, log }: EngineOptio
         objectFit: "contain",
         background: "#000",
         display: "block",
+      });
+      // Fallback pin when rAF is throttled on lock screen — timeupdate still fires for muted video
+      v.addEventListener("timeupdate", () => {
+        if (isFrozenRef.current && !v!.paused) {
+          try {
+            v!.pause();
+          } catch {
+            /* ignore */
+          }
+        }
+        if (isFrozenRef.current) {
+          const target = frozenPosRef.current;
+          if (Math.abs(v!.currentTime - target) > 0.06) {
+            try {
+              v!.currentTime = target;
+            } catch {
+              /* ignore */
+            }
+          }
+        }
       });
       videoRef.current = v;
     }
@@ -407,10 +448,21 @@ export function useFreezeEngine({ elementMode, videoSyncMode, log }: EngineOptio
     }
 
     if (videoRef.current?.src) {
-      // One deliberate, latency-compensated seek on resume, then the controller
-      // keeps it locked with rate nudges (no further seeks unless drift > 1.2s).
-      getSync().hardSync("resume");
-      videoRef.current.play().catch(() => {});
+      const v = videoRef.current;
+      const drift = Math.abs(v.currentTime - el.currentTime);
+      // Only hard-seek if video is meaningfully behind/ahead — small drift is handled by nudge
+      // to avoid the post-resume hitch you saw (snap-correct frame).
+      if (drift > 0.35 || v.paused) {
+        getSync().hardSync("resume");
+      } else {
+        // Keep frame in place, let nudge lock it
+        try {
+          v.currentTime = el.currentTime;
+        } catch {
+          /* ignore */
+        }
+      }
+      v.play().catch(() => {});
       startVideoSync();
     }
 
@@ -436,6 +488,25 @@ export function useFreezeEngine({ elementMode, videoSyncMode, log }: EngineOptio
       `freeze @ ${frozenPosRef.current.toFixed(1)}s / ${frozenDurRef.current.toFixed(1)}s (keep element playing, rate→0, vol→0.001)`
     );
 
+    // Stop video *synchronously* before flipping frozen flag — rAF is throttled on lock screen,
+    // so VideoSyncController's evaluate() may not run for seconds.
+    const vPause = videoRef.current;
+    if (vPause) {
+      stopVideo();
+      try {
+        vPause.pause();
+      } catch {
+        /* ignore */
+      }
+      try {
+        vPause.currentTime = frozenPosRef.current;
+      } catch {
+        /* ignore */
+      }
+    } else {
+      stopVideo();
+    }
+
     // Do NOT call el.pause() — that is what kills the PWA session.
     try {
       el.volume = 0.001;
@@ -454,8 +525,6 @@ export function useFreezeEngine({ elementMode, videoSyncMode, log }: EngineOptio
     publishFrozen();
 
     startPinLoop();
-    videoRef.current?.pause();
-    stopVideo();
 
     if (el.paused) {
       setAudioSessionType();
@@ -805,16 +874,38 @@ export function useFreezeEngine({ elementMode, videoSyncMode, log }: EngineOptio
       logRef.current(`visibility -> ${document.visibilityState}`);
       const el = mediaRef.current;
       if (document.visibilityState === "visible") {
-        if (el && isFrozenRef.current && el.paused) {
-          setAudioSessionType();
-          el.play().catch(() => {});
-          startPinLoop();
+        if (el && isFrozenRef.current) {
+          // Ensure video is still frozen — iOS may have let it run while lock-screen rAF was throttled
+          const v = videoRef.current;
+          if (v && !v.paused) {
+            try {
+              v.pause();
+            } catch {
+              /* ignore */
+            }
+          }
+          if (v && Math.abs(v.currentTime - frozenPosRef.current) > 0.06) {
+            try {
+              v.currentTime = frozenPosRef.current;
+            } catch {
+              /* ignore */
+            }
+          }
+          if (el.paused) {
+            setAudioSessionType();
+            el.play().catch(() => {});
+            startPinLoop();
+          } else {
+            // Already playing at rate 0 — just re-pin
+            startPinLoop();
+          }
         } else if (el && !isFrozenRef.current && isPlayingRef.current && el.paused && !el.ended) {
           void play();
         } else if (el && !isFrozenRef.current && !el.paused && videoRef.current?.src) {
           // Audio kept playing in background; video was paused. One precise
           // catch-up seek, then hand back to the nudge loop.
-          getSync().hardSync("foreground");
+          const drift = Math.abs(videoRef.current.currentTime - el.currentTime);
+          if (drift > 0.35) getSync().hardSync("foreground");
           videoRef.current.play().catch(() => {});
           startVideoSync();
         }
