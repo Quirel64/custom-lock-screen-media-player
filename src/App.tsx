@@ -1,12 +1,35 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import MediaTestPlayer from "./components/MediaTestPlayer";
 import MediaTestPlayerArena from "./components/MediaTestPlayerArena";
+import MediaTestPlayerArchive from "./components/MediaTestPlayerArchive";
 import MediaTestPlayerFreezeExact from "./components/MediaTestPlayerFreezeExact";
 
-type ActiveMode = "anchor" | "freeze" | "arena";
+type ActiveMode = "anchor" | "freeze" | "arena" | "archive";
+
+const LAST_TAB_KEY = "lock-last-tab";
+
+/** Last active tab survives force-close: cold launch lands in the tab that was
+ *  being tested, so no tab switch re-registers handlers before the run. */
+function loadLastTab(): ActiveMode {
+  try {
+    const raw = localStorage.getItem(LAST_TAB_KEY);
+    if (raw === "anchor" || raw === "freeze" || raw === "arena" || raw === "archive") return raw;
+  } catch {
+    /* private mode */
+  }
+  return "freeze";
+}
 
 export default function App() {
-  const [mode, setMode] = useState<ActiveMode>("freeze");
+  const [mode, setMode] = useState<ActiveMode>(loadLastTab);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(LAST_TAB_KEY, mode);
+    } catch {
+      /* private mode */
+    }
+  }, [mode]);
   return (
     <div className="min-h-screen bg-[#05070a] text-white">
       <div className="mx-auto max-w-6xl px-4 py-8 sm:px-6 lg:px-8">
@@ -21,8 +44,9 @@ export default function App() {
             Load an MP4 (video or audio), play it, then lock your phone or switch apps to
             see what the real iOS lock screen draws. Toggle below between{" "}
             <strong className="text-white/80">anchor handoff / single-element freeze</strong>,{" "}
-            <strong className="text-sky-300">Freeze Exact (check it out — single-element rate 0)</strong> and{" "}
-            <strong className="text-sky-300">Arena same-element (silent WAV swap, HOLD_RATE 0.25)</strong>.
+            <strong className="text-sky-300">Freeze Exact (check it out — single-element rate 0)</strong>,{" "}
+            <strong className="text-violet-300">Arena same-element (silent WAV swap, HOLD_RATE 1e-9)</strong> and{" "}
+            <strong className="text-violet-300/70">Arena 26.2 (archived, flag-free baseline)</strong>.
           </p>
           <div className="mt-4 flex flex-wrap gap-2">
             <button
@@ -43,17 +67,28 @@ export default function App() {
             >
               Arena same-element
             </button>
+            <button
+              onClick={() => setMode("archive")}
+              className={`rounded-full px-4 py-2 text-xs font-semibold ${mode === "archive" ? "bg-violet-700 text-white" : "bg-white/10 text-white/60 hover:bg-white/20"}`}
+            >
+              Arena 26.2 (archive)
+            </button>
           </div>
           <p className="mt-2 text-xs text-white/40">
             <span className="text-emerald-300">Anchor</span>: two elements, silent WAV handoff.{" "}
             <span className="text-sky-300">Freeze Exact</span>: verbatim from `check it out` — single
             element keeps playing at rate 0 / vol 0.001, publishes playbackRate 0, pins via rAF+timeupdate, VideoSyncController nudge — fixes Windows stutter loop + iOS seek snap.{" "}
-            <span className="text-violet-300">Arena</span>: one permanent &lt;audio&gt; swaps src track ↔ WAV, HOLD_RATE 0.25.
+            <span className="text-violet-300">Arena</span>: one permanent &lt;audio&gt; swaps src track ↔ WAV,
+            HOLD_RATE 1e-9 — same shape as the main media player, now carrying the 27.x flag panel.{" "}
+            <span className="text-violet-300/70">Arena 26.2</span>: verbatim pre-flag snapshot kept as the
+            pristine baseline.
           </p>
         </header>
 
         {mode === "arena" ? (
           <MediaTestPlayerArena />
+        ) : mode === "archive" ? (
+          <MediaTestPlayerArchive />
         ) : mode === "freeze" ? (
           <MediaTestPlayerFreezeExact />
         ) : (
