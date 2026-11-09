@@ -61,7 +61,7 @@ export default function MediaTestPlayer() {
     getMediaEl: engine.getAudio,
     title: engine.currentTrack?.name ?? "",
     artist: "Lock Screen Test Player",
-    album: engine.sessionStyle === "dual" ? "Dual audio+video session" : "Audio-only session",
+    album: engine.sessionStyle.startsWith("dual") ? "Dual audio+video session" : "Audio-only session",
     artworkUrl,
     mode,
     skipSeconds,
@@ -115,12 +115,12 @@ export default function MediaTestPlayer() {
             <div
               ref={engine.videoContainerRef}
               className={`relative aspect-video w-full bg-black ${
-                engine.currentTrack?.mediaType === "video" && engine.sessionStyle === "dual"
+                engine.currentTrack?.mediaType === "video" && engine.sessionStyle !== "audio-only"
                   ? "block"
                   : "hidden"
               }`}
             />
-            {!(engine.currentTrack?.mediaType === "video" && engine.sessionStyle === "dual") && (
+            {!(engine.currentTrack?.mediaType === "video" && engine.sessionStyle !== "audio-only") && (
               <div className="flex aspect-video w-full flex-col items-center justify-center gap-3 bg-gradient-to-br from-slate-800 to-slate-950">
                 <span className="text-5xl">{engine.currentTrack ? "🎧" : "🎶"}</span>
                 <p className="max-w-[90%] truncate px-4 text-sm text-white/70">
@@ -299,6 +299,7 @@ export default function MediaTestPlayer() {
                   [
                     ["audio-only", "Audio only (lock screen from <audio>)"],
                     ["dual", "Seek-framed <video> (visual only, never plays)"],
+                    ["dual-play", "Video PLAYING muted (main-player style)"],
                   ] as [SessionStyle, string][]
                 ).map(([value, label]) => (
                   <button
@@ -315,8 +316,11 @@ export default function MediaTestPlayer() {
                 ))}
               </div>
               <p className="mt-2 text-[11px] leading-relaxed text-white/40">
-                Video is never the playing element. Playing a &lt;video&gt; is what makes iOS
-                treat the session as video and pause it when you lock the phone.
+                {engine.sessionStyle === "dual-play"
+                  ? "Like the main media player on 26.2: when a video track plays, its <video> element genuinely plays muted alongside the hidden <audio> — TWO playing media elements at lock establishment. This is the reproduction sweep: audio-only always stayed wedge-free; if the wedge reproduces here, the second (muted) element is the reproduction condition."
+                  : engine.sessionStyle === "dual"
+                  ? "Video is parked (paused) at the synced frame. Never the playing element, and never even playing silently — the Arena tab has always been a single-media-session environment."
+                  : "Video is never the playing element. Playing a &lt;video&gt; is what makes iOS treat the session as video and pause it when you lock the phone."}
               </p>
             </div>
 

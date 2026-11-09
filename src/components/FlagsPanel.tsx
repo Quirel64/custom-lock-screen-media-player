@@ -1,5 +1,6 @@
 import {
   type AudioSessionType,
+  type HoldRate,
   type LockFlags,
   type PlaybackStateMode,
 } from "../lib/flags";
@@ -67,6 +68,19 @@ const AUDIO_SESSION_INFO: Record<AudioSessionType, Info> = {
     label: "unset",
     description:
       "Never sets audioSession.type — leaves WebKit's UA default. There is no way to clear it back at runtime; a reload is needed to apply moving away from unset.",
+  },
+};
+
+const HOLD_RATE_INFO: Record<HoldRate, Info> = {
+  "1e-9": {
+    label: "1e-9 (test app)",
+    description:
+      "The test app's shipped constant. Drift while frozen is astronomically slow (years per track). What build 1 used — keep for the honest baseline.",
+  },
+  "1e-7": {
+    label: "1e-7 (main player)",
+    description:
+      "The main media player's shipped tweak: ~4 months of drift per second — still effectively frozen, but a REAL difference from the test app. Select this to make the anchor byte-comparable with the main player.",
   },
 };
 
@@ -175,6 +189,28 @@ export default function FlagsPanel({ flags, onChange, kind }: Props) {
           </div>
           <p className="mt-2 text-[11px] leading-relaxed text-white/40">
             {AUDIO_SESSION_INFO[flags.audioSessionType].description}
+          </p>
+        </div>
+
+        <div>
+          <p className="mb-2 text-[11px] font-medium text-white/60">Anchor hold rate</p>
+          <div className="flex flex-wrap gap-2">
+            {(Object.keys(HOLD_RATE_INFO) as HoldRate[]).map((r) => (
+              <button
+                key={r}
+                onClick={() => onChange({ ...flags, holdRate: r })}
+                className={`rounded-lg px-3 py-2 text-xs font-medium transition ${
+                  flags.holdRate === r
+                    ? "bg-rose-500 text-white"
+                    : "bg-white/10 text-white/70 hover:bg-white/20"
+                }`}
+              >
+                {HOLD_RATE_INFO[r].label}
+              </button>
+            ))}
+          </div>
+          <p className="mt-2 text-[11px] leading-relaxed text-white/40">
+            {HOLD_RATE_INFO[flags.holdRate].description}
           </p>
         </div>
       </div>

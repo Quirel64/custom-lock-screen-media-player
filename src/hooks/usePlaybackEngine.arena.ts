@@ -146,6 +146,12 @@ export function usePlaybackEngine({ flags }: { flags?: LockFlags } = {}) {
     if ("mediaSession" in navigator) navigator.mediaSession.playbackState = effective;
   }, []);
 
+  /** 1e-9 = test app's shipped constant; 1e-7 = the main media player's tweak. */
+  const holdRate = useCallback(
+    () => (flagsRef.current.holdRate === "1e-7" ? 0.0000001 : HOLD_RATE),
+    []
+  );
+
   const getAudio = useCallback(() => mediaRef.current, []);
 
   const stopRaf = useCallback(() => {
@@ -166,12 +172,33 @@ export function usePlaybackEngine({ flags }: { flags?: LockFlags } = {}) {
         ownerRef.current === "track" &&
         !media.paused
       ) {
-        try {
-          if (Math.abs(video.currentTime - media.currentTime) > 0.08) {
-            video.currentTime = media.currentTime;
+        // dual-play (main-player style): the mask <video> genuinely PLAYS muted
+        // alongside the track and is kicked back into step on visible drift —
+        // no rAF pin dependency while hidden (same as the main player).
+        if (styleRef.current === "dual-play") {
+          if (video.paused) {
+            try {
+              void video.play().catch(() => {});
+            } catch {
+              /* ignore */
+            }
           }
-        } catch {
-          /* video metadata may not be ready */
+          try {
+            if (Math.abs(video.currentTime - media.currentTime) > 0.35) {
+              video.currentTime = media.currentTime;
+            }
+          } catch {
+            /* video metadata may not be ready */
+          }
+        } else {
+          // dual (original): video never plays; scrub its parked position only.
+          try {
+            if (Math.abs(video.currentTime - media.currentTime) > 0.08) {
+              video.currentTime = media.currentTime;
+            }
+          } catch {
+            /* video metadata may not be ready */
+          }
         }
         rafRef.current = requestAnimationFrame(tick);
       }
@@ -252,7 +279,7 @@ export function usePlaybackEngine({ flags }: { flags?: LockFlags } = {}) {
       setOwner("idle");
       applyAudioSession();
 
-      const rate = kind === "anchor" ? HOLD_RATE : 1;
+      const rate = kind === "anchor" ? holdRate() : 1;
       const setPositionWhenReady = () => {
         if (token !== transitionTokenRef.current) return;
         const sourceDuration = media.duration;
@@ -291,7 +318,10 @@ export function usePlaybackEngine({ flags }: { flags?: LockFlags } = {}) {
       if (kind === "track") {
         setIsPlaying(true);
         declareTrackState();
-        publishPosition(media.duration || trackDurationRef.current, media.currentTime, 1);
+        // Snap fix: right after a src swap iOS reads currentTime back as 0 until
+        // metadata lands — publishing it made the lock bar flash to 0 on every
+        // unpause. Publish the requested position (frozenPos, authoritative).
+        publishPosition(media.duration || trackDurationRef.current, position, 1);
         startVideoFrames();
       } else {
         setIsPlaying(false);
@@ -299,12 +329,27 @@ export function usePlaybackEngine({ flags }: { flags?: LockFlags } = {}) {
         publishPosition(
           trackDurationRef.current || media.duration,
           frozenPosRef.current,
-          media.playbackRate || HOLD_RATE
+          media.playbackRate || holdRate()
         );
       }
       log(`${kind} source active on permanent element @ ${media.currentTime.toFixed(2)}s`);
+      // dual-play: kick the mask <video> to actually play muted alongside.
+      const maskVideo = videoRef.current;
+      if (kind === "track" && styleRef.current === "dual-play" && maskVideo && maskVideo.src) {
+        const kick = () => {
+          try {
+            maskVideo.currentTime = media.currentTime;
+          } catch {
+            /* ignore */
+          }
+          void maskVideo.play().catch(() => {});
+        };
+        if (maskVideo.readyState >= 1) kick();
+        else maskVideo.addEventListener("loadeddata", kick, { once: true });
+        log("dual-play: muted video playing alongside track (main-player style)");
+      }
     },
-    [applyAudioSession, declareAnchorState, declareTrackState, log, setOwner, startVideoFrames]
+    [applyAudioSession, declareAnchorState, declareTrackState, holdRate, log, setOwner, startVideoFrames]
   );
 
   const play = useCallback(async () => {
@@ -332,7 +377,12 @@ export function usePlaybackEngine({ flags }: { flags?: LockFlags } = {}) {
         setOwner("track");
         setIsPlaying(true);
         declareTrackState();
-        publishPosition(media.duration, media.currentTime, 1);
+        // Snap fix (see activateSource): publish frozenPos, not the live read.
+        publishPosition(
+          media.duration,
+          Number.isFinite(resumePosition) ? resumePosition : media.currentTime,
+          1
+        );
         startVideoFrames();
         log(`track resumed on permanent element @ ${media.currentTime.toFixed(2)}s`);
       } else {
@@ -376,6 +426,9 @@ export function usePlaybackEngine({ flags }: { flags?: LockFlags } = {}) {
       setCurrentTime(position);
       setIsPlaying(false);
       stopRaf();
+      // dual-play hygiene: the mask video genuinely plays while the track does;
+      // both end together when the anchor takes over (as in the main player).
+      videoRef.current?.pause();
 
       if (anchorModeRef.current === "off") {
         media.pause();
@@ -465,7 +518,7 @@ export function usePlaybackEngine({ flags }: { flags?: LockFlags } = {}) {
       publishPosition(
         trackDuration,
         clamped,
-        sourceKindRef.current === "track" ? 1 : media.playbackRate || HOLD_RATE
+        sourceKindRef.current === "track" ? 1 : media.playbackRate || holdRate()
       );
       log(`seek ${clamped.toFixed(2)}s (source=${sourceKindRef.current})`);
     },
@@ -712,7 +765,7 @@ export function usePlaybackEngine({ flags }: { flags?: LockFlags } = {}) {
       publishPosition(
         trackDurationRef.current || media.duration,
         frozen,
-        media.playbackRate || HOLD_RATE
+        media.playbackRate || holdRate()
       );
     };
 
@@ -760,7 +813,7 @@ export function usePlaybackEngine({ flags }: { flags?: LockFlags } = {}) {
   useEffect(() => {
     const track = tracksRef.current[indexRef.current];
     if (!track) return;
-    if (sessionStyle === "dual") attachVideo(track.url);
+    if (sessionStyle === "dual" || sessionStyle === "dual-play") attachVideo(track.url);
     else detachVideo();
   }, [sessionStyle, attachVideo, detachVideo]);
 

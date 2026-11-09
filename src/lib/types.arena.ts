@@ -1,6 +1,6 @@
 export type RepeatMode = "off" | "all" | "one";
 export type SkipMode = "skip10" | "prevnext" | "both";
-export type SessionStyle = "dual" | "audio-only";
+export type SessionStyle = "dual" | "audio-only" | "dual-play";
 /** Who currently owns the iOS audio session. */
 export type SessionOwner = "idle" | "track" | "anchor";
 /**

@@ -28,6 +28,8 @@
 
 export type PlaybackStateMode = "standard" | "no-paused" | "untouched";
 export type AudioSessionType = "playback" | "transient" | "unset";
+/** Anchor hold rate: the test app shipped 1e-9, the main media player runs 1e-7. */
+export type HoldRate = "1e-9" | "1e-7";
 
 export interface LockFlags {
   /**
@@ -59,6 +61,13 @@ export interface LockFlags {
   videoTeardown: boolean;
   /** navigator.audioSession.type: "playback" (default), "transient", or unset. */
   audioSessionType: AudioSessionType;
+  /**
+   * Silent-anchor hold rate. 1e-9 = the test app's shipped constant (drift
+   * astronomically slow); 1e-7 = the main media player's shipped tweak
+   * (~4 months of drift per second — still effectively frozen, validated 26.2).
+   * Only differs in how much the anchor's currentTime can advance while frozen.
+   */
+  holdRate: HoldRate;
 }
 
 const STORAGE_KEY = "lock-flags-27x";
@@ -71,6 +80,7 @@ export const DEFAULT_FLAGS: LockFlags = {
   echoGate: false,
   videoTeardown: false,
   audioSessionType: "playback",
+  holdRate: "1e-9",
 };
 
 export function loadFlags(): LockFlags {
@@ -92,5 +102,5 @@ export function saveFlags(flags: LockFlags) {
 }
 
 export function flagsSummary(flags: LockFlags): string {
-  return `flags: playbackState=${flags.playbackStateMode} echoGate=${flags.echoGate ? 1 : 0} videoTeardown=${flags.videoTeardown ? 1 : 0} audioSession=${flags.audioSessionType}`;
+  return `flags: playbackState=${flags.playbackStateMode} echoGate=${flags.echoGate ? 1 : 0} videoTeardown=${flags.videoTeardown ? 1 : 0} audioSession=${flags.audioSessionType} holdRate=${flags.holdRate}`;
 }
