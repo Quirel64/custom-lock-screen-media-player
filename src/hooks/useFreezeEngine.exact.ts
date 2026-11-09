@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { VideoSyncController, type VideoSyncStats } from "../lib/videoSync";
+import { type LockFlags, type AudioSessionType } from "../lib/flags";
 
 export type VideoSyncMode = "nudge" | "legacy-seek";
 
@@ -18,6 +19,7 @@ export type SessionOwner = "track" | "frozen" | "none";
 interface EngineOptions {
   elementMode: ElementMode;
   videoSyncMode: VideoSyncMode;
+  flags: LockFlags;
   log: (msg: string) => void;
 }
 
@@ -52,10 +54,14 @@ interface EngineOptions {
  *  4. For ~3s after unfreeze, if native currentTime is still way ahead of
  *     expected, re-seek (kills the residual snap).
  */
-function setAudioSessionType() {
+function setAudioSessionType(type: AudioSessionType = "playback") {
   try {
     const nav = navigator as unknown as { audioSession?: { type: string } };
-    if (nav.audioSession) nav.audioSession.type = "playback";
+    // "unset" leaves the session type untouched (there is no way to clear it
+    // back to the UA default once set).
+    if (nav.audioSession && (type === "playback" || type === "transient")) {
+      nav.audioSession.type = type;
+    }
   } catch {
     /* ignore */
   }
@@ -115,7 +121,7 @@ function createTrack(file: File, index: number): Track {
   };
 }
 
-export function useFreezeEngine({ elementMode, videoSyncMode, log }: EngineOptions) {
+export function useFreezeEngine({ elementMode, videoSyncMode, flags, log }: EngineOptions) {
   const [tracks, setTracks] = useState<Track[]>([]);
   const [currentIndex, setCurrentIndex] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -138,6 +144,7 @@ export function useFreezeEngine({ elementMode, videoSyncMode, log }: EngineOptio
   const wantAutoplayRef = useRef(false);
   const unfreezeAtRef = useRef(0);
   const unfreezePosRef = useRef(0);
+  const teardownUrlRef = useRef("");
 
   const logRef = useRef(log);
   logRef.current = log;
@@ -145,6 +152,32 @@ export function useFreezeEngine({ elementMode, videoSyncMode, log }: EngineOptio
   elementModeRef.current = elementMode;
   const videoSyncModeRef = useRef(videoSyncMode);
   videoSyncModeRef.current = videoSyncMode;
+  const flagsRef = useRef(flags);
+  flagsRef.current = flags;
+
+  /**
+   * playbackState writes are routed through here (27.x flags).
+   *
+   * Since bug 305592's commit MediaSession owns a PlatformMediaSession and
+   * `playbackState = "paused"` natively calls clientWillPausePlayback() — our
+   * frozen state is *element-playing*, so declaring "paused" now contradicts
+   * reality inside WebKit's session manager. `no-paused` declares the element
+   * truth ("playing" + rate-0 position), `untouched` never writes at all.
+   */
+  const setPbState = useCallback((state: "playing" | "paused", whileFrozen: boolean) => {
+    const mode = flagsRef.current.playbackStateMode;
+    if (mode === "untouched") return;
+    // no-paused: while the element is silently producing (frozen), never declare
+    // a native pause. All other writes pass through unchanged.
+    const effective = whileFrozen && mode === "no-paused" ? "playing" : state;
+    if ("mediaSession" in navigator) navigator.mediaSession.playbackState = effective;
+  }, []);
+
+  /** Session type from the flag — see lib/flags.ts hypothesis #3. */
+  const applyAudioSessionType = useCallback(() => {
+    setAudioSessionType(flagsRef.current.audioSessionType);
+  }, []);
+
   const tracksRef = useRef(tracks);
   tracksRef.current = tracks;
   const currentIndexRef = useRef(currentIndex);
@@ -374,7 +407,7 @@ export function useFreezeEngine({ elementMode, videoSyncMode, log }: EngineOptio
       return;
     }
 
-    setAudioSessionType();
+    applyAudioSessionType();
 
     if (isFrozenRef.current) {
       const pos = frozenPosRef.current;
@@ -387,7 +420,7 @@ export function useFreezeEngine({ elementMode, videoSyncMode, log }: EngineOptio
 
       // 1. Stop Now Playing interpolation BEFORE anything else.
       publish(pos, dur, 0);
-      if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "paused";
+      setPbState("paused", false);
 
       // 2. Seek back to the freeze point and wait. If we restore rate=1 first,
       // iOS samples the drifted native currentTime and the bar jumps forward.
@@ -415,7 +448,7 @@ export function useFreezeEngine({ elementMode, videoSyncMode, log }: EngineOptio
       }
 
       publish(pos, dur, 1);
-      if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "playing";
+      setPbState("playing", false);
     }
 
     try {
@@ -424,7 +457,7 @@ export function useFreezeEngine({ elementMode, videoSyncMode, log }: EngineOptio
       logRef.current(`play failed: ${String(e)}`);
       await new Promise((r) => setTimeout(r, 120));
       try {
-        setAudioSessionType();
+        applyAudioSessionType();
         await el.play();
       } catch (e2) {
         logRef.current(`play retry failed: ${String(e2)}`);
@@ -469,7 +502,7 @@ export function useFreezeEngine({ elementMode, videoSyncMode, log }: EngineOptio
     setIsPlaying(true);
     isPlayingRef.current = true;
     setSessionOwner("track");
-    if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "playing";
+    setPbState("playing", false);
     publish(el.currentTime, el.duration, 1);
     setCurrentTime(el.currentTime);
     logRef.current(`play ok @ ${el.currentTime.toFixed(1)}s vol=${el.volume.toFixed(3)}`);
@@ -521,13 +554,13 @@ export function useFreezeEngine({ elementMode, videoSyncMode, log }: EngineOptio
     setSessionOwner("frozen");
     setCurrentTime(frozenPosRef.current);
 
-    if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "paused";
+    setPbState("paused", true);
     publishFrozen();
 
     startPinLoop();
 
     if (el.paused) {
-      setAudioSessionType();
+      applyAudioSessionType();
       el.play().catch((e) => logRef.current(`freeze play failed: ${String(e)}`));
     }
   }, [publishFrozen, startPinLoop]);
@@ -547,6 +580,17 @@ export function useFreezeEngine({ elementMode, videoSyncMode, log }: EngineOptio
     const el = mediaRef.current;
     if (!el) return;
     logRef.current(`remote pause/resume frozen=${isFrozenRef.current} paused=${el.paused}`);
+
+    // 27.x echo gate (bug 305592): while hidden, iOS interruptions dispatch the
+    // "pause" action byte-identically to a user press. If we are already frozen
+    // and hold the was-playing position, a pause press while hidden can only be
+    // an interruption echo — honoring it means play() DURING an interruption,
+    // the audio-session-steal pattern Apple ships a quirk against (Tubular).
+    if (flagsRef.current.echoGate && document.visibilityState !== "visible" && isFrozenRef.current) {
+      logRef.current("echo-gate: pause press while hidden+frozen IGNORED (echo)");
+      return;
+    }
+
     if (isFrozenRef.current) void play();
     else pause();
   }, [play, pause]);
@@ -654,7 +698,7 @@ export function useFreezeEngine({ elementMode, videoSyncMode, log }: EngineOptio
           album: track.mediaType === "video" ? "Video track" : "Audio track",
         });
       }
-      setAudioSessionType();
+      applyAudioSessionType();
       logRef.current(
         `loadTrack [${index + 1}/${list.length}] ${track.name} autoplay=${autoplay}`
       );
@@ -750,7 +794,7 @@ export function useFreezeEngine({ elementMode, videoSyncMode, log }: EngineOptio
       setIsPlaying(true);
       isPlayingRef.current = true;
       setSessionOwner("track");
-      if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "playing";
+      setPbState("playing", false);
       publish(audio.currentTime, audio.duration, 1);
       if (videoRef.current?.src) {
         // Don't seek here — play() already did one hardSync. A second seek right
@@ -765,14 +809,14 @@ export function useFreezeEngine({ elementMode, videoSyncMode, log }: EngineOptio
       if (isFrozenRef.current) {
         // iOS may pause us in the PWA. Keep the freeze session alive.
         logRef.current("native pause while frozen — restarting element");
-        setAudioSessionType();
+        applyAudioSessionType();
         audio.play().catch(() => {});
         return;
       }
       if (document.visibilityState === "visible" || audio.ended) {
         setIsPlaying(false);
         isPlayingRef.current = false;
-        if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "paused";
+        setPbState("paused", false);
         publish(audio.currentTime, audio.duration, 0);
         stopVideo();
         logRef.current("track pause event");
@@ -802,7 +846,7 @@ export function useFreezeEngine({ elementMode, videoSyncMode, log }: EngineOptio
     audio.addEventListener("pause", onPause);
     audio.addEventListener("ended", onEnded);
     audio.addEventListener("error", onError);
-    setAudioSessionType();
+    applyAudioSessionType();
 
     return () => {
       audio.removeEventListener("timeupdate", onTime);
@@ -874,6 +918,32 @@ export function useFreezeEngine({ elementMode, videoSyncMode, log }: EngineOptio
       logRef.current(`visibility -> ${document.visibilityState}`);
       const el = mediaRef.current;
       if (document.visibilityState === "visible") {
+        // 27.x video teardown: re-arm the muted <video> we stripped on hidden,
+        // so lock establishment happened against a single media session.
+        const teardownUrl = teardownUrlRef.current;
+        if (teardownUrl) {
+          teardownUrlRef.current = "";
+          const v = videoRef.current;
+          if (v) {
+            logRef.current(`teardown: video re-armed (hidden had stripped src)`);
+            v.src = teardownUrl;
+            v.load();
+            const target = isFrozenRef.current ? frozenPosRef.current : el?.currentTime ?? 0;
+            const onReady = () => {
+              v.removeEventListener("loadeddata", onReady);
+              try {
+                v.currentTime = target;
+              } catch {
+                /* ignore */
+              }
+              if (!isFrozenRef.current && v.paused && el && !el.paused) {
+                v.play().catch(() => {});
+                startVideoSync();
+              }
+            };
+            v.addEventListener("loadeddata", onReady);
+          }
+        }
         if (el && isFrozenRef.current) {
           // Ensure video is still frozen — iOS may have let it run while lock-screen rAF was throttled
           const v = videoRef.current;
@@ -892,7 +962,7 @@ export function useFreezeEngine({ elementMode, videoSyncMode, log }: EngineOptio
             }
           }
           if (el.paused) {
-            setAudioSessionType();
+            applyAudioSessionType();
             el.play().catch(() => {});
             startPinLoop();
           } else {
@@ -910,7 +980,19 @@ export function useFreezeEngine({ elementMode, videoSyncMode, log }: EngineOptio
           startVideoSync();
         }
       } else {
-        videoRef.current?.pause();
+        // 27.x video teardown: strip the mask video for the lock so WebKit never
+        // has two media sessions (one of them silent) at lock establishment —
+        // hypotheses #3 (category churn) and the video Now Playing rework.
+        const v = videoRef.current;
+        if (v && flagsRef.current.videoTeardown && v.getAttribute("src")) {
+          teardownUrlRef.current = v.getAttribute("src") ?? "";
+          v.pause();
+          v.removeAttribute("src");
+          v.load();
+          logRef.current("teardown: video src cleared for lock (hidden)");
+        } else {
+          videoRef.current?.pause();
+        }
         stopVideo();
       }
     };
@@ -1029,7 +1111,7 @@ export function useFreezeEngine({ elementMode, videoSyncMode, log }: EngineOptio
       return true;
     }
     try {
-      setAudioSessionType();
+      applyAudioSessionType();
       const wasFrozen = isFrozenRef.current;
       await el.play();
       await new Promise((r) => setTimeout(r, 80));
