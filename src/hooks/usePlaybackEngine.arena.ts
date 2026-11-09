@@ -15,7 +15,7 @@ type SourceKind = "track" | "anchor";
 type Command = "play" | "pause";
 
 // Safari accepts this as real playback while keeping unavoidable anchor drift
-// small. Timers are not guaranteed while a standalone PWA is hidden, so
+// small. Timers are not guaranteed while a standalone PWA is hidden so
 // correctness cannot depend on the rewind firing.
 const HOLD_RATE = 0.000000001;
 
