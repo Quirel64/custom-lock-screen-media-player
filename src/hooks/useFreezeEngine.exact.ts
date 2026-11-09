@@ -420,7 +420,7 @@ export function useFreezeEngine({ elementMode, videoSyncMode, flags, log }: Engi
 
       // 1. Stop Now Playing interpolation BEFORE anything else.
       publish(pos, dur, 0);
-      setPbState("paused", false);
+      setPbState("paused", true);
 
       // 2. Seek back to the freeze point and wait. If we restore rate=1 first,
       // iOS samples the drifted native currentTime and the bar jumps forward.

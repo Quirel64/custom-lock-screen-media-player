@@ -13,10 +13,9 @@ import {
   saveFlags,
   flagsSummary,
   type LockFlags,
-  type PlaybackStateMode,
-  type AudioSessionType,
 } from "../lib/flags";
 import EventLog from "./EventLog";
+import FlagsPanel from "./FlagsPanel";
 import LockScreenPreview from "./LockScreenPreview";
 import PlaylistPanel from "./PlaylistPanel.exact";
 import VideoSurface from "./VideoSurface.exact";
@@ -57,42 +56,6 @@ const OWNER_LABEL: Record<SessionOwner, { text: string; color: string }> = {
   none: {
     text: "No session",
     color: "bg-white/10 text-white/40 ring-white/10",
-  },
-};
-
-const PBSTATE_INFO: Record<PlaybackStateMode, { label: string; description: string }> = {
-  standard: {
-    label: "Standard (26.2-style)",
-    description:
-      "Frozen publishes playbackState \"paused\" + playbackRate 0. This is the pre-27 behavior. Hypothesis to test: since 27.x this write has native side effects (clientWillPausePlayback) while our element is still silently producing.",
-  },
-  "no-paused": {
-    label: "Never declare paused",
-    description:
-      "Frozen publishes rate 0 position but keeps playbackState \"playing\" (matches element reality). Tests whether the native pause declaration wedges the 27.x lock session.",
-  },
-  untouched: {
-    label: "Untouched (guessed state)",
-    description:
-      "Never writes playbackState at all; the platform's \"guessed state\" (element-derived, per spec fallback) rules the lock UI. Cleanest read on who owns the icon.",
-  },
-};
-
-const AUDIO_SESSION_INFO: Record<AudioSessionType, { label: string; description: string }> = {
-  playback: {
-    label: "playback",
-    description:
-      "navigator.audioSession.type = \"playback\" — long-form default, holds session aggressively.",
-  },
-  transient: {
-    label: "transient",
-    description:
-      "navigator.audioSession.type = \"transient\" — reported (27.x) to let another source take over cleanly and fix permanent lock-screen takeover",
-  },
-  unset: {
-    label: "unset",
-    description:
-      "Never sets audioSession.type — leaves WebKit's UA default. There is no way to clear it back at runtime; reload to apply a change away from unset.",
   },
 };
 
@@ -442,103 +405,7 @@ export default function MediaTestPlayerFreezeExact() {
               </p>
             </div>
 
-            <div className="rounded-lg border border-violet-400/30 bg-violet-500/5 p-3">
-              <p className="mb-1 text-xs font-semibold text-violet-200">
-                27.x WebKit flags (persistent — survives force-close)
-              </p>
-              <p className="mb-3 text-[11px] leading-relaxed text-white/40">
-                Targets the 26.2→27.x changes: interruptions now dispatch the
-                &quot;pause&quot; action (bug 305592), playbackState writes have native side
-                effects, and the audio-session category tracks muted playback (bug 308083).
-                Test one flag at a time: play → lock → wait → touch controls.
-              </p>
-
-              <div className="space-y-4">
-                <div>
-                  <p className="mb-2 text-[11px] font-medium text-white/60">playbackState discipline</p>
-                  <div className="flex flex-wrap gap-2">
-                    {(Object.keys(PBSTATE_INFO) as PlaybackStateMode[]).map((pm) => (
-                      <button
-                        key={pm}
-                        onClick={() => setFlags((f) => ({ ...f, playbackStateMode: pm }))}
-                        className={`rounded-lg px-3 py-2 text-xs font-medium transition ${
-                          flags.playbackStateMode === pm
-                            ? "bg-violet-500 text-white"
-                            : "bg-white/10 text-white/70 hover:bg-white/20"
-                        }`}
-                      >
-                        {PBSTATE_INFO[pm].label}
-                      </button>
-                    ))}
-                  </div>
-                  <p className="mt-2 text-[11px] leading-relaxed text-white/40">
-                    {PBSTATE_INFO[flags.playbackStateMode].description}
-                  </p>
-                </div>
-
-                <div>
-                  <p className="mb-2 text-[11px] font-medium text-white/60">Interruption echo gate</p>
-                  <button
-                    onClick={() => setFlags((f) => ({ ...f, echoGate: !f.echoGate }))}
-                    className={`rounded-lg px-3 py-2 text-xs font-medium transition ${
-                      flags.echoGate
-                        ? "bg-emerald-500 text-white"
-                        : "bg-white/10 text-white/70 hover:bg-white/20"
-                    }`}
-                  >
-                    {flags.echoGate ? "ON — hidden pause press ignored while frozen" : "OFF"}
-                  </button>
-                  <p className="mt-2 text-[11px] leading-relaxed text-white/40">
-                    While the page is hidden and we are frozen, a lock &quot;pause&quot; press
-                    can only be the new WebKit interruption echo — honoring it would call
-                    play() during an interruption (the documented audio-session steal).
-                  </p>
-                </div>
-
-                <div>
-                  <p className="mb-2 text-[11px] font-medium text-white/60">Video teardown on lock</p>
-                  <button
-                    onClick={() => setFlags((f) => ({ ...f, videoTeardown: !f.videoTeardown }))}
-                    className={`rounded-lg px-3 py-2 text-xs font-medium transition ${
-                      flags.videoTeardown
-                        ? "bg-emerald-500 text-white"
-                        : "bg-white/10 text-white/70 hover:bg-white/20"
-                    }`}
-                  >
-                    {flags.videoTeardown
-                      ? "ON — mask video stripped at hidden, re-armed at visible"
-                      : "OFF"}
-                  </button>
-                  <p className="mt-2 text-[11px] leading-relaxed text-white/40">
-                    Lock establishment then happens with a single media session — no muted
-                    second decoder, no element that "started playing while muted" in the
-                    new category model. No-decode replacement for video-delayed-start.
-                  </p>
-                </div>
-
-                <div>
-                  <p className="mb-2 text-[11px] font-medium text-white/60">audioSession.type</p>
-                  <div className="flex flex-wrap gap-2">
-                    {(Object.keys(AUDIO_SESSION_INFO) as AudioSessionType[]).map((t) => (
-                      <button
-                        key={t}
-                        onClick={() => setFlags((f) => ({ ...f, audioSessionType: t }))}
-                        className={`rounded-lg px-3 py-2 text-xs font-medium transition ${
-                          flags.audioSessionType === t
-                            ? "bg-amber-500 text-white"
-                            : "bg-white/10 text-white/70 hover:bg-white/20"
-                        }`}
-                      >
-                        {AUDIO_SESSION_INFO[t].label}
-                      </button>
-                    ))}
-                  </div>
-                  <p className="mt-2 text-[11px] leading-relaxed text-white/40">
-                    {AUDIO_SESSION_INFO[flags.audioSessionType].description}
-                  </p>
-                </div>
-              </div>
-            </div>
+            <FlagsPanel flags={flags} onChange={setFlags} kind="freeze" />
 
             <div className="flex items-center justify-between rounded-lg bg-black/20 px-3 py-2">
               <label htmlFor="skipSeconds" className="text-xs text-white/60">

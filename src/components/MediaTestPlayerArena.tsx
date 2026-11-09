@@ -1,10 +1,17 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { usePlaybackEngine } from "../hooks/usePlaybackEngine.arena";
 import { useMediaSessionController, type SkipMode } from "../hooks/useMediaSessionController.arena";
 import { generateArtwork } from "../lib/artwork";
+import {
+  flagsSummary,
+  loadFlags,
+  saveFlags,
+  type LockFlags,
+} from "../lib/flags";
 import { formatTime } from "../lib/format";
 import type { AnchorMode, SessionStyle } from "../lib/types.arena";
 import EventLog from "./EventLog";
+import FlagsPanel from "./FlagsPanel";
 import HandoffStatus from "./HandoffStatus.arena";
 import LockScreenPreview from "./LockScreenPreview";
 import PlaylistPanel from "./PlaylistPanel.arena";
@@ -28,10 +35,19 @@ const MODE_INFO: Record<SkipMode, { label: string; description: string }> = {
 };
 
 export default function MediaTestPlayer() {
-  const engine = usePlaybackEngine();
+  const [flags, setFlags] = useState<LockFlags>(() => loadFlags());
+  const engine = usePlaybackEngine({ flags });
   const [mode, setMode] = useState<SkipMode>("skip10");
   const [skipSeconds, setSkipSeconds] = useState(10);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  // Boot flags line + persistence — same discipline as the Freeze tab and the
+  // main app's EventLog. The engine keeps its own ref in sync via the prop.
+  useEffect(() => {
+    engine.log(flagsSummary(flags));
+    saveFlags(flags);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [flags]);
 
   const artworkUrl = useMemo(
     () => generateArtwork(engine.currentTrack?.name ?? "MP"),
@@ -321,6 +337,8 @@ export default function MediaTestPlayer() {
               </div>
               <p className="mt-2 text-[11px] leading-relaxed text-white/40">{MODE_INFO[mode].description}</p>
             </div>
+
+            <FlagsPanel flags={flags} onChange={setFlags} kind="arena" />
 
             <div className="flex items-center justify-between rounded-lg bg-black/20 px-3 py-2">
               <label htmlFor="skipSeconds" className="text-xs text-white/60">

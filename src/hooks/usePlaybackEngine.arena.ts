@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createSilentWavUrl, describeSilentWav } from "../lib/silentAudio.arena";
 import { delay, setPlaybackAudioSession } from "../lib/audioSession.arena";
+import { type LockFlags, loadFlags as loadFlagsLocal } from "../lib/flags";
 import {
   createTrack,
   type AnchorMode,
@@ -63,7 +64,7 @@ function publishPosition(duration: number, position: number, playbackRate: numbe
  * action callback. We do not await metadata before calling play(); doing so
  * loses iOS's remote-control activation in standalone mode.
  */
-export function usePlaybackEngine() {
+export function usePlaybackEngine({ flags }: { flags?: LockFlags } = {}) {
   const mediaRef = useRef<HTMLAudioElement | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const videoContainerRef = useRef<HTMLDivElement | null>(null);
@@ -84,6 +85,10 @@ export function usePlaybackEngine() {
   const queuedCommandRef = useRef<Command | null>(null);
   const commandRunnerRef = useRef<((command: Command) => void) | null>(null);
   const rafRef = useRef(0);
+  const teardownUrlRef = useRef("");
+
+  const flagsRef = useRef<LockFlags>(flags ?? loadFlagsLocal());
+  flagsRef.current = flags ?? flagsRef.current;
 
   const [tracks, setTracks] = useState<PlaylistTrack[]>([]);
   const [currentIndex, setCurrentIndex] = useState(0);
@@ -113,6 +118,32 @@ export function usePlaybackEngine() {
   const setOwner = useCallback((owner: SessionOwner) => {
     ownerRef.current = owner;
     setSessionOwner(owner);
+  }, []);
+
+  /** Session type from the flag — see lib/flags.ts hypothesis #3/#4. */
+  const applyAudioSession = useCallback(() => {
+    setPlaybackAudioSession(flagsRef.current.audioSessionType);
+  }, []);
+
+  /**
+   * 27.x playbackState gate (bug 305592's commit gave MediaSession its own
+   * PlatformMediaSession, so playbackState writes now natively call
+   * clientWillBeginPlayback() / clientWillPausePlayback()).
+   *  - track:  always "playing" (except untouched mode).
+   *  - anchor: standard → "paused" (user-facing truth, matches the media
+   *            player); no-paused → "playing" (shipped posture — the anchor is
+   *            genuinely playing silence); untouched → never write.
+   */
+  const declareTrackState = useCallback(() => {
+    if (flagsRef.current.playbackStateMode === "untouched") return;
+    if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "playing";
+  }, []);
+
+  const declareAnchorState = useCallback(() => {
+    const mode = flagsRef.current.playbackStateMode;
+    if (mode === "untouched") return;
+    const effective = mode === "standard" ? "paused" : "playing";
+    if ("mediaSession" in navigator) navigator.mediaSession.playbackState = effective;
   }, []);
 
   const getAudio = useCallback(() => mediaRef.current, []);
@@ -219,7 +250,7 @@ export function usePlaybackEngine() {
       const token = ++transitionTokenRef.current;
       sourceKindRef.current = kind;
       setOwner("idle");
-      setPlaybackAudioSession();
+      applyAudioSession();
 
       const rate = kind === "anchor" ? HOLD_RATE : 1;
       const setPositionWhenReady = () => {
@@ -259,20 +290,21 @@ export function usePlaybackEngine() {
       setOwner(kind);
       if (kind === "track") {
         setIsPlaying(true);
+        declareTrackState();
         publishPosition(media.duration || trackDurationRef.current, media.currentTime, 1);
         startVideoFrames();
       } else {
         setIsPlaying(false);
+        declareAnchorState();
         publishPosition(
           trackDurationRef.current || media.duration,
           frozenPosRef.current,
           media.playbackRate || HOLD_RATE
         );
       }
-      if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "playing";
       log(`${kind} source active on permanent element @ ${media.currentTime.toFixed(2)}s`);
     },
-    [log, setOwner, startVideoFrames]
+    [applyAudioSession, declareAnchorState, declareTrackState, log, setOwner, startVideoFrames]
   );
 
   const play = useCallback(async () => {
@@ -292,14 +324,14 @@ export function usePlaybackEngine() {
     try {
       const resumePosition = frozenPosRef.current;
       if (sourceKindRef.current === "track" && media.src === track.url) {
-        setPlaybackAudioSession();
+        applyAudioSession();
         if (Number.isFinite(resumePosition)) media.currentTime = resumePosition;
         // Called before await so iOS keeps the activation.
         const directPlay = media.play();
         await directPlay;
         setOwner("track");
         setIsPlaying(true);
-        if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "playing";
+        declareTrackState();
         publishPosition(media.duration, media.currentTime, 1);
         startVideoFrames();
         log(`track resumed on permanent element @ ${media.currentTime.toFixed(2)}s`);
@@ -320,7 +352,7 @@ export function usePlaybackEngine() {
       transitionRef.current = false;
       flushQueuedCommand();
     }
-  }, [activateSource, flushQueuedCommand, log, setOwner, startVideoFrames]);
+  }, [activateSource, applyAudioSession, declareTrackState, flushQueuedCommand, log, setOwner, startVideoFrames]);
 
   const pause = useCallback(async () => {
     const media = mediaRef.current;
@@ -348,7 +380,7 @@ export function usePlaybackEngine() {
       if (anchorModeRef.current === "off") {
         media.pause();
         setOwner("idle");
-        if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "paused";
+        declareAnchorState();
         publishPosition(trackDurationRef.current || media.duration, position, 1);
         log(`paused without placeholder @ ${position.toFixed(2)}s`);
         return;
@@ -385,6 +417,21 @@ export function usePlaybackEngine() {
 
   const remotePause = useCallback(() => {
     log(`remote pause (source=${sourceKindRef.current}, owner=${ownerRef.current})`);
+
+    // 27.x echo gate (bug 305592): while hidden, iOS interruptions dispatch the
+    // "pause" action byte-identically to a user press. While the silent anchor
+    // holds the position, a pause press while hidden can only be an echo —
+    // honoring it would swap back to the track = play() DURING an interruption,
+    // the audio-session-steal pattern Apple ships a quirk against (bug 314264).
+    if (
+      flagsRef.current.echoGate &&
+      document.visibilityState !== "visible" &&
+      sourceKindRef.current === "anchor"
+    ) {
+      log("echo-gate: pause press while hidden+anchored IGNORED (echo)");
+      return;
+    }
+
     void pause();
   }, [log, pause]);
 
@@ -581,10 +628,10 @@ export function usePlaybackEngine() {
         const media = mediaRef.current;
         media?.pause();
         setOwner("idle");
-        if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "paused";
+        declareAnchorState();
       }
     },
-    [setOwner]
+    [declareAnchorState, setOwner]
   );
 
   // The one audio element is created once and remains in the DOM for the
@@ -630,7 +677,8 @@ export function usePlaybackEngine() {
       } else {
         setIsPlaying(false);
       }
-      if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "playing";
+      if (kind === "track") declareTrackState();
+      else declareAnchorState();
       log(`native playing event (${kind}, same element)`);
     };
 
@@ -692,7 +740,7 @@ export function usePlaybackEngine() {
     media.addEventListener("stalled", onStalled);
     media.addEventListener("suspend", onSuspend);
 
-    setPlaybackAudioSession();
+    applyAudioSession();
     log("permanent audio element ready (same-element source handoff)");
 
     return () => {
@@ -722,16 +770,51 @@ export function usePlaybackEngine() {
     const onVisible = () => {
       log(`document.visibilityState -> ${document.visibilityState}`);
       if (document.visibilityState === "hidden") {
+        // 27.x video teardown: strip the mask <video> for the lock so WebKit
+        // never has two media sessions (one of them muted) at lock
+        // establishment — hypotheses #4/#5 (category churn + video Now
+        // Playing ownership rework).
+        const v = videoRef.current;
+        if (v && flagsRef.current.videoTeardown && v.getAttribute("src")) {
+          teardownUrlRef.current = v.getAttribute("src") ?? "";
+          v.pause();
+          v.removeAttribute("src");
+          v.load();
+          log("teardown: video src cleared for lock (hidden)");
+        } else {
+          videoRef.current?.pause();
+        }
         stopRaf();
-        videoRef.current?.pause();
         return;
       }
-      setPlaybackAudioSession();
+      // 27.x video teardown: re-arm the stripped <video> on the way back in.
+      const teardownUrl = teardownUrlRef.current;
+      if (teardownUrl) {
+        teardownUrlRef.current = "";
+        const v = videoRef.current;
+        const media = mediaRef.current;
+        if (v) {
+          log("teardown: video re-armed (hidden had stripped src)");
+          v.src = teardownUrl;
+          v.load();
+          const target = media ? media.currentTime : frozenPosRef.current;
+          const rearm = () => {
+            v.removeEventListener("loadeddata", rearm);
+            try {
+              v.currentTime = target;
+            } catch {
+              /* ignore */
+            }
+          };
+          v.addEventListener("loadeddata", rearm);
+        }
+      }
+      applyAudioSession();
       const media = mediaRef.current;
       if (ownerRef.current === "track" && media && !media.paused) startVideoFrames();
     };
     const onPageShow = (event: PageTransitionEvent) => {
-      setPlaybackAudioSession();
+      applyAudioSession();
       log(`pageshow${event.persisted ? " (bfcache)" : ""}`);
     };
     document.addEventListener("visibilitychange", onVisible);
@@ -740,7 +823,7 @@ export function usePlaybackEngine() {
       document.removeEventListener("visibilitychange", onVisible);
       window.removeEventListener("pageshow", onPageShow);
     };
-  }, [log, startVideoFrames, stopRaf]);
+  }, [applyAudioSession, log, startVideoFrames, stopRaf]);
 
   useEffect(() => {
     return () => tracksRef.current.forEach((track) => URL.revokeObjectURL(track.url));

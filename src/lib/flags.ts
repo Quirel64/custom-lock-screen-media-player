@@ -31,11 +31,15 @@ export type AudioSessionType = "playback" | "transient" | "unset";
 
 export interface LockFlags {
   /**
-   * How MediaSession.playbackState is written while frozen.
-   *  standard  — as-is: frozen publishes "paused" + rate 0 (the pre-27 behavior).
-   *  no-paused — frozen publishes rate 0 position but playbackState stays
-   *              "playing" (matches element reality; hypothesis: the native
-   *              clientWillPausePlayback() side effect wedges the lock session).
+   * How MediaSession.playbackState is written while the user-facing state is
+   * "paused" (frozen element or silent anchor).
+   *  standard  — declare the user-facing truth: "paused" while frozen/anchored.
+   *              On the (outdated) freeze engine this is the pre-27 posture.
+   *              On the Arena engine this matches the main media player's flow
+   *              (anchor → playbackState=paused).
+   *  no-paused — keep declaring "playing" while the element is still genuinely
+   *              producing (silent WAV at HOLD_RATE in Arena; rate-0 in freeze).
+   *              This is the posture the Arena engine shipped with on 26.2.
    *  untouched — playbackState is never written at all; the platform "guessed
    *              state" (spec-fallback from the element) rules.
    */
@@ -60,7 +64,10 @@ export interface LockFlags {
 const STORAGE_KEY = "lock-flags-27x";
 
 export const DEFAULT_FLAGS: LockFlags = {
-  playbackStateMode: "standard",
+  // "no-paused" preserves the posture the shipped Arena engine had (always
+  // declaring "playing", even while the silent anchor holds), so the A/B
+  // baseline is honest: the default IS build-1 behavior on the Arena tab.
+  playbackStateMode: "no-paused",
   echoGate: false,
   videoTeardown: false,
   audioSessionType: "playback",
