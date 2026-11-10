@@ -857,13 +857,24 @@ export function usePlaybackEngine({ flags }: { flags?: LockFlags } = {}) {
         // never has two media sessions (one of them muted) at lock
         // establishment — hypotheses #4/#5 (category churn + video Now
         // Playing ownership rework).
+        //
+        // SAFETY GUARD (2026-11-10 data point): stripping the src of a PLAYING
+        // mask video (dual-play) killed the session irrecoverably — no reviving
+        // by pause/unpause, refresh, or even disabling the flag (audio stuck in
+        // a mixable category until the session TYPE was reset). So teardown may
+        // only strip a PARKED (paused) video; a live dual-play video is paused
+        // and left intact for the lock instead.
         const v = videoRef.current;
         if (v && flagsRef.current.videoTeardown && v.getAttribute("src")) {
-          teardownUrlRef.current = v.getAttribute("src") ?? "";
-          v.pause();
-          v.removeAttribute("src");
-          v.load();
-          log("teardown: video src cleared for lock (hidden)");
+          if (!v.paused) {
+            v.pause();
+            log("teardown skipped strip: mask video was playing (live element) — paused only");
+          } else {
+            teardownUrlRef.current = v.getAttribute("src") ?? "";
+            v.removeAttribute("src");
+            v.load();
+            log("teardown: parked video src cleared for lock (hidden)");
+          }
         } else {
           videoRef.current?.pause();
         }

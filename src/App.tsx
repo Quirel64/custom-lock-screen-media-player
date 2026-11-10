@@ -3,8 +3,9 @@ import MediaTestPlayer from "./components/MediaTestPlayer";
 import MediaTestPlayerArena from "./components/MediaTestPlayerArena";
 import MediaTestPlayerArchive from "./components/MediaTestPlayerArchive";
 import MediaTestPlayerFreezeExact from "./components/MediaTestPlayerFreezeExact";
+import MediaTestPlayerMainCopy from "./components/MediaTestPlayerMainCopy";
 
-type ActiveMode = "anchor" | "freeze" | "arena" | "archive";
+type ActiveMode = "anchor" | "freeze" | "arena" | "archive" | "maincopy";
 
 const LAST_TAB_KEY = "lock-last-tab";
 
@@ -13,7 +14,15 @@ const LAST_TAB_KEY = "lock-last-tab";
 function loadLastTab(): ActiveMode {
   try {
     const raw = localStorage.getItem(LAST_TAB_KEY);
-    if (raw === "anchor" || raw === "freeze" || raw === "arena" || raw === "archive") return raw;
+    if (
+      raw === "anchor" ||
+      raw === "freeze" ||
+      raw === "arena" ||
+      raw === "archive" ||
+      raw === "maincopy"
+    ) {
+      return raw;
+    }
   } catch {
     /* private mode */
   }
@@ -73,6 +82,12 @@ export default function App() {
             >
               Arena 26.2 (archive)
             </button>
+            <button
+              onClick={() => setMode("maincopy")}
+              className={`rounded-full px-4 py-2 text-xs font-semibold ${mode === "maincopy" ? "bg-orange-500 text-white" : "bg-white/10 text-white/60 hover:bg-white/20"}`}
+            >
+              Main player (carbon copy)
+            </button>
           </div>
           <p className="mt-2 text-xs text-white/40">
             <span className="text-emerald-300">Anchor</span>: two elements, silent WAV handoff.{" "}
@@ -89,6 +104,8 @@ export default function App() {
           <MediaTestPlayerArena />
         ) : mode === "archive" ? (
           <MediaTestPlayerArchive />
+        ) : mode === "maincopy" ? (
+          <MediaTestPlayerMainCopy />
         ) : mode === "freeze" ? (
           <MediaTestPlayerFreezeExact />
         ) : (
