@@ -21,6 +21,10 @@ const OWNER_LABEL: Record<SessionOwner, { text: string; className: string }> = {
     text: "Placeholder hold (tap native pause again to resume)",
     className: "bg-amber-500/20 text-amber-200",
   },
+  frozen: {
+    text: "Frozen hold (muted rate~0 — Windows/no-swap keep-alive)",
+    className: "bg-sky-500/20 text-sky-200",
+  },
 };
 
 export default function HandoffStatus({

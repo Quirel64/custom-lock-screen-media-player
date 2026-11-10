@@ -28,30 +28,40 @@
 
 /* CARBON-COPY SCOPE PATCH: this CSS is imported globally into the test env,
    so the original `html, body, #root { height:100%; overflow:hidden }` pinned
-   the WHOLE test page. The same viewport is applied to the copy's own wrapper
-   (#main-copy-root) instead; html/body stay under the test env's control. */
+   the WHOLE test page. The same viewport (and skin) is applied to the copy's
+   own wrapper (#main-copy-root) instead; html/body stay under the test env. */
 #main-copy-root {
   height: 88vh;
   width: 100%;
   overflow: hidden;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  background-color: var(--color-slate-950);
+  color: var(--color-slate-200);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
 body {
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-  background-color: var(--color-slate-950);
-  color: var(--color-slate-200);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  /* Touch-first player: no text selection or iOS long-press callout anywhere
+     except editable fields. Kills stray selection during hold-to-drag holds
+     (which otherwise grabs far-away buttons like the lock-screen toggle). */
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
 }
 
-/* SCOPE PATCH: font/bg/color defaults belong on the copy's wrapper, not the
-   body (this CSS is global inside the test env). */
-#main-copy-root {
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-  background-color: var(--color-slate-950);
-  color: var(--color-slate-200);
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
+input, textarea {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+/* Debug log must stay copyable despite the global no-select rule. */
+.selectable, .selectable * {
+  -webkit-user-select: text !important;
+  user-select: text !important;
+  -webkit-touch-callout: default !important;
 }
 
 ::-webkit-scrollbar {

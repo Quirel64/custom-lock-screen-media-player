@@ -116,7 +116,7 @@ export function PlayBar({ currentTrack, onTogglePlay, onNext, onPrev, onSeek }: 
           <button
             onClick={onPrev}
             className="p-2 transition-colors hover:opacity-80"
-            style={{ color: '#94a3b8' }}
+            style={{ color: '#94a3b8', touchAction: 'manipulation' }}
           >
             <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
               <path d="M6 6h2v12H6zm3.5 6l8.5 6V6z" />
@@ -126,7 +126,7 @@ export function PlayBar({ currentTrack, onTogglePlay, onNext, onPrev, onSeek }: 
           <button
             onClick={onTogglePlay}
             className="flex h-10 w-10 items-center justify-center rounded-full bg-white active:scale-95"
-            style={{ color: '#0a0e1a' }}
+            style={{ color: '#0a0e1a', touchAction: 'manipulation' }}
           >
             {isPlaying ? (
               <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
@@ -142,7 +142,7 @@ export function PlayBar({ currentTrack, onTogglePlay, onNext, onPrev, onSeek }: 
           <button
             onClick={onNext}
             className="p-2 transition-colors hover:opacity-80"
-            style={{ color: '#94a3b8' }}
+            style={{ color: '#94a3b8', touchAction: 'manipulation' }}
           >
             <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
               <path d="M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z" />

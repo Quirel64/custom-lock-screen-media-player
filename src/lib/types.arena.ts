@@ -2,7 +2,7 @@ export type RepeatMode = "off" | "all" | "one";
 export type SkipMode = "skip10" | "prevnext" | "both";
 export type SessionStyle = "dual" | "audio-only" | "dual-play";
 /** Who currently owns the iOS audio session. */
-export type SessionOwner = "idle" | "track" | "anchor";
+export type SessionOwner = "idle" | "track" | "anchor" | "frozen";
 /**
  * handoff — one permanent audio element swaps between track and placeholder
  * off     — no placeholder; a long pause may kill the iOS PWA audio session

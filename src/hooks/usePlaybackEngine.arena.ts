@@ -19,6 +19,16 @@ type Command = "play" | "pause";
 // correctness cannot depend on the rewind firing.
 const HOLD_RATE = 0.000000001;
 
+/**
+ * Apple-mobile Safari (iPhone/iPad) is the only platform where the PWA
+ * session-kill timer makes the silent-anchor keep-alive necessary. Desktop
+ * Chromium keeps lock/controls for a paused element AND the src-swap anchor
+ * confuses its audio pipeline into a ~1s "same second repeats" loop (observed
+ * at every hold rate on Windows, incl. 1e-7) — so Windows gets the
+ * freeze-engine posture: element keeps playing muted at rate ~0, src untouched.
+ */
+const IS_APPLE_MOBILE = /iP(hone|od|ad)/.test(navigator.userAgent);
+
 function hideOffscreen(el: HTMLElement) {
   el.style.position = "fixed";
   el.style.left = "-8px";
@@ -394,6 +404,12 @@ export function usePlaybackEngine({ flags }: { flags?: LockFlags } = {}) {
       if (sourceKindRef.current === "track" && media.src === track.url) {
         applyAudioSession();
         if (Number.isFinite(resumePosition)) media.currentTime = resumePosition;
+        if (!IS_APPLE_MOBILE) {
+          // Restore any freeze-hold posture (muted/low-rate) before resume.
+          media.volume = 1;
+          media.defaultPlaybackRate = 1;
+          media.playbackRate = 1;
+        }
         // Called before await so iOS keeps the activation.
         const directPlay = media.play();
         await directPlay;
@@ -452,6 +468,29 @@ export function usePlaybackEngine({ flags }: { flags?: LockFlags } = {}) {
       // dual-play hygiene: the mask video genuinely plays while the track does;
       // both end together when the anchor takes over (as in the main player).
       videoRef.current?.pause();
+
+      if (!IS_APPLE_MOBILE) {
+        // Windows/desktop Chromium freeze hold: no swap, no anchor — the
+        // element keeps playing muted at rate ~0 (src untouched), which also
+        // keeps the session alive and sidesteps the desktop repeat loop.
+        media.volume = 0.001;
+        try {
+          media.defaultPlaybackRate = 0;
+          media.playbackRate = 0;
+        } catch {
+          try {
+            media.defaultPlaybackRate = 0.0625;
+            media.playbackRate = 0.0625;
+          } catch {
+            /* keep normal rate */
+          }
+        }
+        declareAnchorState();
+        publishPosition(trackDurationRef.current || media.duration, position, 0);
+        setOwner("frozen");
+        log(`windows freeze hold (muted rate~0, no swap) @ ${position.toFixed(2)}s`);
+        return;
+      }
 
       if (anchorModeRef.current === "off") {
         media.pause();
@@ -595,6 +634,7 @@ export function usePlaybackEngine({ flags }: { flags?: LockFlags } = {}) {
       media.autoplay = autoplay;
       media.defaultPlaybackRate = 1;
       media.playbackRate = 1;
+      media.volume = 1;
       media.src = track.url;
       media.load();
 
@@ -602,9 +642,24 @@ export function usePlaybackEngine({ flags }: { flags?: LockFlags } = {}) {
       else detachVideo();
 
       log(`loaded [${nextIndex + 1}/${list.length}] ${track.name}${autoplay ? " (autoplay)" : ""}`);
-      if (autoplay) void play();
+      if (autoplay) {
+        void play();
+      } else if (IS_APPLE_MOBILE && anchorModeRef.current === "handoff") {
+        // Paused-navigation keep-alive (observed kill: prev pressed while
+        // user-paused then left idle — a loaded-but-not-playing element expires
+        // the iOS PWA session within seconds). Re-establish the anchor for the
+        // NEW track as soon as its duration is known; play() stays one tap.
+        const reAnchor = () => {
+          media.removeEventListener("loadedmetadata", reAnchor);
+          if (indexRef.current !== nextIndex) return;
+          ensureAnchor(trackDurationRef.current || media.duration || 2);
+          void activateSource("anchor", anchorUrlRef.current, 0);
+          log(`paused navigation: fresh track re-anchored at 0 (session keep-alive)`);
+        };
+        media.addEventListener("loadedmetadata", reAnchor);
+      }
     },
-    [attachVideo, detachVideo, log, play, setOwner]
+    [activateSource, attachVideo, detachVideo, ensureAnchor, log, play, setOwner]
   );
 
   const goToTrack = useCallback(

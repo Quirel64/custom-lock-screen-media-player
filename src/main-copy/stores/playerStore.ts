@@ -30,6 +30,7 @@ interface PlayerStore {
   setOriginalOrder: (tracks: Track[]) => void
   setTrackVolume: (trackId: string, volume: number) => void
   setShuffleOrder: (order: number[]) => void
+  syncShuffleToQueue: (startIndex: number) => void
   getNextTrackIndex: () => number | null
   getPrevTrackIndex: () => number | null
   getCurrentTrack: () => Track | null
@@ -77,6 +78,29 @@ export const usePlayerStore = create<PlayerStore>((set, get) => ({
       // Turning shuffle OFF: restore original order
       set({ shuffleOn: false, shuffleOrder: [] })
     }
+  },
+
+  // Rebuilds the shuffle permutation for the CURRENT queue (queue replacements
+  // otherwise leave stale positional indices: shuffle-on in a 64-track library
+  // then opening a 4-track playlist made next jump to index 45 of 4 → dead
+  // track + blank video). Tapped index goes front = a fresh cycle from there,
+  // so manual taps never strand playback mid-permutation. No-op when off.
+  syncShuffleToQueue: (startIndex: number) => {
+    const { shuffleOn, queue } = get()
+    if (!shuffleOn) {
+      if (get().shuffleOrder.length > 0) set({ shuffleOrder: [] })
+      return
+    }
+    if (queue.length === 0) { set({ shuffleOrder: [] }); return }
+    const start = Math.max(0, Math.min(startIndex, queue.length - 1))
+    const indices = Array.from({ length: queue.length }, (_, i) => i)
+    const shuffled = fisherYatesShuffle(indices)
+    const pos = shuffled.indexOf(start)
+    if (pos > 0) {
+      shuffled.splice(pos, 1)
+      shuffled.unshift(start)
+    }
+    set({ shuffleOrder: shuffled })
   },
 
   cycleRepeat: () =>
