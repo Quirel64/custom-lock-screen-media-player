@@ -308,6 +308,23 @@ export function usePlaybackEngine({ flags }: { flags?: LockFlags } = {}) {
       media.src = url;
       media.load();
 
+      // Carbon-copy parity (main player @ b5e2c76, "playbackState sync before
+      // await"): pin the element and the lock state BEFORE the await. iOS
+      // resets its internal bar to the element's timeline on a src swap; if
+      // positioning + declaring happen only after `await playPromise`, the bar
+      // draws element-zero first — the Arena unpause snap. Pre-arming in the
+      // same gesture stack as play() is what the snapless main player does.
+      try {
+        media.currentTime = Math.min(
+          Math.max(0, position),
+          Math.max(0, (media.duration || trackDurationRef.current || position) - 0.35)
+        );
+      } catch {
+        /* setPositionWhenReady retries after metadata lands */
+      }
+      if (kind === "track") declareTrackState();
+      else declareAnchorState();
+
       // Must be invoked in the direct UI/MediaSession callback stack.
       const playPromise = media.play();
       await playPromise;
