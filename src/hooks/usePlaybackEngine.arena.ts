@@ -87,6 +87,13 @@ export function usePlaybackEngine({ flags }: { flags?: LockFlags } = {}) {
   const styleRef = useRef<SessionStyle>("audio-only");
   const anchorModeRef = useRef<AnchorMode>("handoff");
   const ownerRef = useRef<SessionOwner>("idle");
+  /**
+   * Paused-navigation anchor: when the user paused and navigated (no autoplay),
+   * the re-anchor holds the session alive but the USER-FACING truth is paused.
+   * Declaring "playing" there produced the |> / || flip-around (play presses
+   * arrived as "pause" and needed the reconcile rescue + an extra press).
+   */
+  const pausedParkRef = useRef(false);
   const sourceKindRef = useRef<SourceKind>("track");
   const frozenPosRef = useRef(0);
   const trackDurationRef = useRef(0);
@@ -152,7 +159,8 @@ export function usePlaybackEngine({ flags }: { flags?: LockFlags } = {}) {
   const declareAnchorState = useCallback(() => {
     const mode = flagsRef.current.playbackStateMode;
     if (mode === "untouched") return;
-    const effective = mode === "standard" ? "paused" : "playing";
+    const effective =
+      mode === "standard" || pausedParkRef.current ? "paused" : "playing";
     if ("mediaSession" in navigator) navigator.mediaSession.playbackState = effective;
   }, []);
 
@@ -392,6 +400,7 @@ export function usePlaybackEngine({ flags }: { flags?: LockFlags } = {}) {
       log("play ignored — no track loaded");
       return;
     }
+    pausedParkRef.current = false;
     if (transitionRef.current) {
       queuedCommandRef.current = "play";
       log("play queued behind source swap");
@@ -447,6 +456,13 @@ export function usePlaybackEngine({ flags }: { flags?: LockFlags } = {}) {
     const media = mediaRef.current;
     if (!media) return;
     if (sourceKindRef.current === "anchor") {
+      // Parked navigation anchor: the track is paused BY INTENT (declared
+      // paused). A pause press here must not "resume" a paused track — that
+      // inverted state is what produced the flip-around on device.
+      if (pausedParkRef.current) {
+        log("pause ignored: parked-navigation anchor (already paused)");
+        return;
+      }
       // iOS still shows || because the placeholder is genuinely playing.
       log("pause command while placeholder active → resume track");
       void play();
@@ -485,7 +501,12 @@ export function usePlaybackEngine({ flags }: { flags?: LockFlags } = {}) {
             /* keep normal rate */
           }
         }
-        declareAnchorState();
+        // The user-facing truth is PAUSED. Declaring "playing" (the anchor
+        // declaration, true only for the iOS silent loop) made desktop's
+        // play button dispatch "pause" forever — a frozen deadlock on device.
+        if (flagsRef.current.playbackStateMode !== "untouched" && "mediaSession" in navigator) {
+          navigator.mediaSession.playbackState = "paused";
+        }
         publishPosition(trackDurationRef.current || media.duration, position, 0);
         setOwner("frozen");
         log(`windows freeze hold (muted rate~0, no swap) @ ${position.toFixed(2)}s`);
@@ -543,6 +564,12 @@ export function usePlaybackEngine({ flags }: { flags?: LockFlags } = {}) {
 
   const remotePause = useCallback(() => {
     log(`remote pause (source=${sourceKindRef.current}, owner=${ownerRef.current})`);
+
+    // Windows freeze hold: already held; a pause press would just re-freeze.
+    if (ownerRef.current === "frozen") {
+      log("remote pause ignored: frozen hold already active");
+      return;
+    }
 
     // Reconcile (see togglePlay): after a takeover without a dispatched pause,
     // the element is ALREADY paused — a lock "pause" press must not freeze into
@@ -649,6 +676,9 @@ export function usePlaybackEngine({ flags }: { flags?: LockFlags } = {}) {
         // user-paused then left idle — a loaded-but-not-playing element expires
         // the iOS PWA session within seconds). Re-establish the anchor for the
         // NEW track as soon as its duration is known; play() stays one tap.
+        // Parked declaration: playbackState "paused" so the lock |> press
+        // arrives as PLAY and resumes the real track in one tap.
+        pausedParkRef.current = true;
         const reAnchor = () => {
           media.removeEventListener("loadedmetadata", reAnchor);
           if (indexRef.current !== nextIndex) return;

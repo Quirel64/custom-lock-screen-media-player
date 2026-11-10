@@ -39,20 +39,17 @@
   color: var(--color-slate-200);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-}
-
-body {
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
   /* Touch-first player: no text selection or iOS long-press callout anywhere
      except editable fields. Kills stray selection during hold-to-drag holds
-     (which otherwise grabs far-away buttons like the lock-screen toggle). */
+     (which otherwise grabs far-away buttons like the lock-screen toggle).
+     SCOPE PATCH: was on `body` — that leaked into the WHOLE test app and made
+     its EventLog unselectable. */
   -webkit-user-select: none;
   user-select: none;
   -webkit-touch-callout: none;
 }
 
-input, textarea {
+#main-copy-root input, #main-copy-root textarea {
   -webkit-user-select: text;
   user-select: text;
 }
