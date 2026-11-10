@@ -318,10 +318,16 @@ export function usePlaybackEngine({ flags }: { flags?: LockFlags } = {}) {
       if (kind === "track") {
         setIsPlaying(true);
         declareTrackState();
-        // Snap fix: right after a src swap iOS reads currentTime back as 0 until
-        // metadata lands — publishing it made the lock bar flash to 0 on every
-        // unpause. Publish the requested position (frozenPos, authoritative).
-        publishPosition(media.duration || trackDurationRef.current, position, 1);
+        // Snap fix (v2): right after a src swap iOS reads currentTime back as 0
+        // until metadata lands — publishing it made the lock bar flash to 0 on
+        // every unpause. Publish the requested position (frozenPos), and skip
+        // the publish entirely when hidden (remote resume): the anchor's
+        // setPositionState already carries exactly this position/duration, so
+        // publishing mid-swap only churns the lock bar toward the element's
+        // fresh timeline. On visible the handler re-publishes the live values.
+        if (document.visibilityState === "visible") {
+          publishPosition(media.duration || trackDurationRef.current, position, 1);
+        }
         startVideoFrames();
       } else {
         setIsPlaying(false);
@@ -459,9 +465,20 @@ export function usePlaybackEngine({ flags }: { flags?: LockFlags } = {}) {
   };
 
   const togglePlay = useCallback(() => {
+    const media = mediaRef.current;
+    // 27.x interruption reconcile: a takeover (e.g. YouTube) can kill the
+    // session WITHOUT dispatching our pause handler, leaving the element paused
+    // while the engine still believes the track is playing and owns the UI.
+    // In that state the knob must RESUME the track directly — "pausing again"
+    // into the anchor is what produced the two-press to get sound back.
+    if (media && sourceKindRef.current === "track" && ownerRef.current === "track" && media.paused) {
+      log("reconcile: element paused while engine believed track playing → direct resume");
+      void play();
+      return;
+    }
     if (ownerRef.current === "track") void pause();
     else void play();
-  }, [pause, play]);
+  }, [log, pause, play]);
 
   const remotePlay = useCallback(() => {
     log(`remote play (source=${sourceKindRef.current}, owner=${ownerRef.current})`);
@@ -470,6 +487,15 @@ export function usePlaybackEngine({ flags }: { flags?: LockFlags } = {}) {
 
   const remotePause = useCallback(() => {
     log(`remote pause (source=${sourceKindRef.current}, owner=${ownerRef.current})`);
+
+    // Reconcile (see togglePlay): after a takeover without a dispatched pause,
+    // the element is ALREADY paused — a lock "pause" press must not freeze into
+    // the anchor; it would just re-anchor a dead track.
+    const media = mediaRef.current;
+    if (media && media.paused && sourceKindRef.current === "track") {
+      log("remote pause ignored: element already paused (interrupted reality)");
+      return;
+    }
 
     // 27.x echo gate (bug 305592): while hidden, iOS interruptions dispatch the
     // "pause" action byte-identically to a user press. While the silent anchor
@@ -555,7 +581,7 @@ export function usePlaybackEngine({ flags }: { flags?: LockFlags } = {}) {
       media.src = track.url;
       media.load();
 
-      if (styleRef.current === "dual") attachVideo(track.url);
+      if (styleRef.current === "dual" || styleRef.current === "dual-play") attachVideo(track.url);
       else detachVideo();
 
       log(`loaded [${nextIndex + 1}/${list.length}] ${track.name}${autoplay ? " (autoplay)" : ""}`);
@@ -811,11 +837,15 @@ export function usePlaybackEngine({ flags }: { flags?: LockFlags } = {}) {
   }, []);
 
   useEffect(() => {
-    const track = tracksRef.current[indexRef.current];
+    // Re-attach on CURRENT TRACK change too (deps include currentIndex): with
+    // dual-play active, track load and auto-advance must mount the new video,
+    // otherwise the mask shows a frozen first frame (or the previous video).
+    const track = tracksRef.current[currentIndex];
     if (!track) return;
     if (sessionStyle === "dual" || sessionStyle === "dual-play") attachVideo(track.url);
     else detachVideo();
-  }, [sessionStyle, attachVideo, detachVideo]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionStyle, currentIndex, attachVideo, detachVideo]);
 
   // Reassert Safari's playback category whenever the PWA is restored. Do not
   // recreate the permanent element or change its source here.
@@ -864,7 +894,23 @@ export function usePlaybackEngine({ flags }: { flags?: LockFlags } = {}) {
       }
       applyAudioSession();
       const media = mediaRef.current;
-      if (ownerRef.current === "track" && media && !media.paused) startVideoFrames();
+      if (ownerRef.current === "track" && media && !media.paused) {
+        startVideoFrames();
+        // Main-player parity: on return the mask video catches up to the audio
+        // immediately instead of showing a stale frame until the next play().
+        const v = videoRef.current;
+        if (v && styleRef.current === "dual-play" && v.getAttribute("src")) {
+          try {
+            v.currentTime = media.currentTime;
+          } catch {
+            /* ignore */
+          }
+          if (v.paused) void v.play().catch(() => {});
+        }
+        // Re-publish the session position on the way in (rAF is dead while
+        // hidden, so the last setPositionState is what the lock bar saw).
+        publishPosition(trackDurationRef.current || media.duration, media.currentTime, 1);
+      }
     };
     const onPageShow = (event: PageTransitionEvent) => {
       applyAudioSession();
