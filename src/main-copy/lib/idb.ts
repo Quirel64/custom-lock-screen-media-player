@@ -1,7 +1,12 @@
 import { openDB, type IDBPDatabase, type DBSchema } from 'idb'
 import type { Track, Playlist } from './types'
 
-const DB_NAME = 'media-player-db'
+// CARBON-COPY SCOPE PATCH: the deployed main player runs on the SAME GitHub
+// Pages origin and owns `media-player-db` (already at version 5). Opening that
+// DB at this copy's version 3 throws VersionError AND the copy would read and
+// write the player's real library. The copy therefore gets its own isolated
+// database; do not rename it back.
+const DB_NAME = 'media-player-db-copy'
 const DB_VERSION = 3
 const TRACKS_STORE = 'tracks'
 const PLAYLISTS_STORE = 'playlists'

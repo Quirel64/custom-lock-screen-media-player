@@ -21,5 +21,9 @@ import MainApp from "../main-copy/App";
 import "../main-copy/index.css";
 
 export default function MediaTestPlayerMainCopy() {
-  return <MainApp />;
+  return (
+    <div id="main-copy-root" className="relative">
+      <MainApp />
+    </div>
+  );
 }

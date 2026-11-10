@@ -26,13 +26,27 @@
   box-sizing: border-box;
 }
 
-html, body, #root {
-  height: 100%;
+/* CARBON-COPY SCOPE PATCH: this CSS is imported globally into the test env,
+   so the original `html, body, #root { height:100%; overflow:hidden }` pinned
+   the WHOLE test page. The same viewport is applied to the copy's own wrapper
+   (#main-copy-root) instead; html/body stay under the test env's control. */
+#main-copy-root {
+  height: 88vh;
   width: 100%;
   overflow: hidden;
 }
 
 body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  background-color: var(--color-slate-950);
+  color: var(--color-slate-200);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* SCOPE PATCH: font/bg/color defaults belong on the copy's wrapper, not the
+   body (this CSS is global inside the test env). */
+#main-copy-root {
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
   background-color: var(--color-slate-950);
   color: var(--color-slate-200);
