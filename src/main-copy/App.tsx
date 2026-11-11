@@ -56,6 +56,10 @@ export default function App() {
       // localStorage across force-closes, so every diagnosis needs to know
       // which combination the session actually ran with.
       addLog(`flags: video-paused-mode=${isVideoPausedMode() ? 1 : 0} lock-resilient-toggle=${isLockResilientToggle() ? 1 : 0} lock-revive-on-hidden=${isLockReviveOnHidden() ? 1 : 0} (revive ${getLockReviveDelay()}ms) video-delayed-start=${isVideoDelayedStart() ? 1 : 0} minimal-handlers=${isMinimalHandlers() ? 1 : 0} echo-aware-toggle=${isEchoAwareToggle() ? 1 : 0} lock-warm-cycle=${isLockWarmCycle() ? 1 : 0} (warm ${getWarmCycleDelay()}ms) thumb-probe-play=${getProbeDuringPlayback() ? 1 : 0}`)
+      // ARENA ENGINE PORT (round-8 winning combo, pinned ON): the session
+      // layer now runs the arena posture regardless of the legacy flags above
+      // (which only remain for their still-active video/revive experiments).
+      addLog('arena port: playbackState=no-paused echoGate=ON videoTeardown=OFF audioSession=playback presses=engine-aware parkedNav=ON windowsFreezeHold=ON')
       // Fast path first: localStorage reads instantly even when a hot/throttled
       // device takes seconds to open IndexedDB (handlers then apply correctly
       // on the very first lock). IDB confirms afterwards; both stay in sync.

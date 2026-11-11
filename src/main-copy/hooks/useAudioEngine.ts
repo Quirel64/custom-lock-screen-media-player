@@ -5,7 +5,7 @@ import { queueKey } from '../lib/queue'
 import { getTrackFileURL } from '../lib/idb'
 import { showError } from '../components/ui/Toast'
 import { addLog } from '../lib/logger'
-import { isVideoPausedMode, isLockResilientToggle, isVideoDelayedStart, isEchoAwareToggle, isLockWarmCycle, getWarmCycleDelay } from '../lib/mediaFlags'
+import { isVideoPausedMode, isVideoDelayedStart, isLockWarmCycle, getWarmCycleDelay } from '../lib/mediaFlags'
 import { createSilentWavUrl, describeSilentWav } from '../lib/silentAudio'
 import { getPlayingArtwork } from '../lib/artwork'
 
@@ -30,23 +30,39 @@ import { getPlayingArtwork } from '../lib/artwork'
 const HOLD_RATE = 0.0000001
 const FALLBACK_HOLD_RATE = 0.0625
 // HOLD_RATE 1e-7 keeps bar frozen (~4 months/sec) while anchor holds session; 0 made bar drift to end (see 13:44 logs)
-const INVERT_LOCK_ICON_TEST = false
 
-// Experiment 6 (echo-aware toggle) discriminators: performance.now() of OUR OWN
-// pause actions vs the last EXTERNAL native pause (element paused without our
-// request = interruption). Verified on device: interruption echo pairs arrive
-// INSIDE the same second as our own pause (sub-600ms), while a human resume
-// re-press lands ≥1s later — so a pause press within PAIR_WINDOW_MS of our own
-// pause is the echo pair, no native-pause evidence needed (at swap time the
-// external pause event is swallowed by the transition guard — proven blind).
-const ECHO_WINDOW_MS = 4000
+/* ============================================================
+   ARENA ENGINE PORT (round-8 winning combo, all pinned ON):
+   - playbackState: NO-PAUSED — the anchor declares "playing"
+     (it IS playing silence). Declaring it "paused" produced
+     declared/icon mismatch loops (the triple-tap) on iOS 27.2.
+     The ONE exception: a PARKED navigation anchor (user paused
+     by intent) declares "paused" so the lock shows > and one
+     press resumes the real track.
+   - echo gate: a pause press while hidden + anchored is bug
+     305592's echo dispatch — ignored, never a resume (resuming
+     would steal the session back = the YouTube tussle). This
+     gate is the round-8 load-bearing requirement.
+   - resilient presses: BOTH center buttons are engine-aware
+     (route via remotePauseOrResume), never literal.
+   - Windows/desktop: freeze hold instead of the src-swap
+     anchor (muted, rate~0, no swap — sidesteps the desktop
+     src-swap repeat loop); a pause press there = resume
+     (Chromium derives the icon from the playing-muted element).
+   - parked navigation: non-autoplay loads re-anchor with a
+     duration-matched WAV so the session survives; a play
+     intent makes the real track take over instead.
+   The mediaFlags experiments (resilient/echo-aware/warm-cycle
+   toggles) are retired for the session layer; UI toggles stay
+   but no longer change these behaviors.
+   ============================================================ */
 const OWN_PAUSE_ECHO_MS = 1500
-const PAIR_WINDOW_MS = 600
-// Armed-resume confirmation window (Experiment 8): during this many ms after
-// an anchor pause press we hold the resume, waiting to see whether iOS
-// pauses our anchor natively (another source claiming focus = interruption,
-// cancel); otherwise it was a human and we resume.
-const CONFIRM_WINDOW_MS = 350
+/** Desktop/Windows freeze hold: element keeps playing muted at rate ~0. */
+const FROZEN_VOLUME = 0.001
+
+/** Apple-mobile Safari is the only platform where the PWA session-kill timer
+ *  makes the silent-anchor keep-alive necessary (verified rounds 6-8). */
+const IS_APPLE_MOBILE = /iP(hone|od|ad)/.test(navigator.userAgent)
 
 function setRate(el: HTMLMediaElement, rate: number) {
   try { el.defaultPlaybackRate = rate; el.playbackRate = rate } catch {
@@ -67,8 +83,10 @@ function publishPosition(duration: number, position: number, playbackRate: numbe
   try { navigator.mediaSession.setPositionState({ duration, playbackRate, position: Math.min(Math.max(0, position), duration) }) } catch { /* ignore iOS during transition */ }
 }
 function getLockPlaybackState(kind: 'track' | 'anchor'): MediaSessionPlaybackState {
-  if (INVERT_LOCK_ICON_TEST) return kind === 'track' ? 'paused' : 'playing'
-  return kind === 'track' ? 'playing' : 'paused'
+  // No-paused posture (arena round-8 winner): BOTH kinds declare "playing".
+  // The parked navigation anchor overrides to "paused" at its call sites.
+  void kind
+  return 'playing'
 }
 function delay(ms: number) { return new Promise<void>(r => setTimeout(r, ms)) }
 
@@ -117,9 +135,15 @@ export function useAudioEngine() {
   // Experiment 7 guard: the synthetic pause→play warm pair must not flip
   // store state or feed the external-pause detector.
   const warmCycleRef = useRef(false)
-  // Experiment 8 state: token invalidating stale armed resumes (any newer
-  // press, play press, or arm supersedes the pending one).
-  const resumeArmTokenRef = useRef(0)
+  // Experiment 8 state: token invalidating stale armed resumes — RETIRED with
+  // the arena port (the simple echo gate + engine-aware presses replace the
+  // armed-resume machinery; round 8 verified the simple gate wins).
+  // ARENA PORT: sticky play intent (true from play request until a real pause;
+  // owner flips to idle mid-swap so it cannot answer "was the user playing?")
+  const playIntentRef = useRef(false)
+  // ARENA PORT: parked navigation anchor — paused by intent, declares "paused",
+  // re-anchored per track so the session survives; any press there resumes.
+  const pausedParkRef = useRef(false)
   const queuedCommandRef = useRef<'play' | 'pause' | null>(null)
   // Swap serialization: rapid lock-screen next/prev (<1s apart) used to overlap
   // src swaps on the one element — each media.load() aborts the previous
@@ -153,7 +177,7 @@ export function useAudioEngine() {
   const nextGestureRef = useRef(false)
 
   const sourceKindRef = useRef<SourceKind>('track')
-  const ownerRef = useRef<'idle' | 'track' | 'anchor'>('idle')
+  const ownerRef = useRef<'idle' | 'track' | 'anchor' | 'frozen'>('idle')
   const pendingAnchorPosRef = useRef<number | null>(null)
 
   const { currentTrackIndex, queue, volume, isMuted, setPlaying, setCurrentTime, setDuration, setCurrentTrackIndex } = usePlayerStore()
@@ -276,7 +300,7 @@ export function useAudioEngine() {
     if (vv && (!vv.muted || vv.volume !== 0)) { try { vv.muted = true; vv.volume = 0 } catch { /* ignore */ } }
   }, [])
 
-  const setOwner = useCallback((o: 'idle' | 'track' | 'anchor') => { ownerRef.current = o }, [])
+  const setOwner = useCallback((o: 'idle' | 'track' | 'anchor' | 'frozen') => { ownerRef.current = o }, [])
 
   const ensureAnchor = useCallback((trackDuration: number) => {
     const target = Math.max(2, Number.isFinite(trackDuration) ? trackDuration : 2)
@@ -465,6 +489,10 @@ export function useAudioEngine() {
     const track = state.queue[state.currentTrackIndex] ?? currentTrack
     const media = mediaRef.current
     if (!track || !media) { addLog(`play ignored — no track (queue ${state.queue.length} idx ${state.currentTrackIndex})`); return }
+    // ARENA PORT: any play intent leaves the parked state and is sticky until
+    // a real pause (the paced catch-up reads this at fire time).
+    playIntentRef.current = true
+    pausedParkRef.current = false
     if (pendingAnchorPosRef.current !== null) {
       const pend = pendingAnchorPosRef.current
       pendingAnchorPosRef.current = null
@@ -487,6 +515,12 @@ export function useAudioEngine() {
       const vResume = videoRef.current
       if (sourceKindRef.current === 'track' && currentBlobIsTrack) {
         setAudioSessionType()
+        if (!IS_APPLE_MOBILE) {
+          // Restore the Windows freeze-hold posture (muted/low-rate) before resume.
+          const st = usePlayerStore.getState()
+          try { media.volume = st.isMuted ? 0 : st.volume } catch { /* ignore */ }
+          setRate(media, 1)
+        }
         if (Number.isFinite(resumePos) && Math.abs((media.currentTime || 0) - resumePos) > 0.15) try { media.currentTime = resumePos } catch {}
         // Ensure video seeked to resumePos before play (fix ahead after lock resume)
         if (isVideoResume && vResume && vResume.src) {
@@ -542,91 +576,49 @@ export function useAudioEngine() {
     finally { transitionRef.current = false; flushQueued() }
   }, [activateSource, currentTrack, flushQueued, setOwner, setPlaying, maybePlayVideo])
 
-  // Experiment 8 (armed resume): a pause press while anchored means "resume"
-  // under resilience — but when another source is claiming focus, iOS pauses
-  // our anchor natively a moment later. Hold the resume for a short
-  // confirmation window: an external native pause inside it cancels (we stay
-  // conceded, the other source wins); no event = it was a human, resume.
-  const armConfirmedResume = useCallback(() => {
-    const token = ++resumeArmTokenRef.current
-    addLog(`echo-aware: resume armed (${CONFIRM_WINDOW_MS}ms confirmation window)`)
-    setTimeout(() => {
-      if (token !== resumeArmTokenRef.current) return
-      const m = mediaRef.current
-      if (!m) return
-      if (sourceKindRef.current !== 'anchor' || ownerRef.current !== 'anchor') return
-      if (usePlayerStore.getState().isPlaying) return
-      const sinceExternal = lastExternalPauseAtRef.current > 0 ? performance.now() - lastExternalPauseAtRef.current : Infinity
-      if (sinceExternal < CONFIRM_WINDOW_MS) {
-        addLog('echo-aware: armed resume canceled — external pause during confirmation window')
-        return
-      }
-      addLog('echo-aware: armed resume firing (no external pause in window)')
-      void play()
-    }, CONFIRM_WINDOW_MS)
-  }, [play])
-
   const pause = useCallback(async () => {
     const media = mediaRef.current
     if (!media) return
+    playIntentRef.current = false
     if (sourceKindRef.current === 'anchor' || pendingAnchorPosRef.current !== null) {
-      // Resilient workaround (default): iOS 26.2 showed an inverted icon in this
-      // state, so a "pause" press really meant resume. On iOS 27.2 interruptions
-      // arrive as pause presses and re-asserting play causes ping-pong/AbortError,
-      // so Experiment 2 (EventLog "Resilient toggle") renders it literal: an
-      // extra pause while already-paused/pending is a no-op, never a resume.
-      if (isLockResilientToggle()) {
-        // Echo-aware guard: same rules as remotePauseOrResume — a pause press
-        // within the pair window of our own pause, or within 4s of an
-        // external native pause, is an interruption echo → ignore.
-        const sinceOwn = performance.now() - lastOwnPauseAtRef.current
-        const sinceExternal = lastExternalPauseAtRef.current > 0 ? performance.now() - lastExternalPauseAtRef.current : Infinity
-        if (isEchoAwareToggle() && (sinceOwn < PAIR_WINDOW_MS || sinceExternal < ECHO_WINDOW_MS)) {
-          addLog(`pause while placeholder/pending after own ${Math.round(sinceOwn)}ms / external ${Number.isFinite(sinceExternal) ? Math.round(sinceExternal) : '∞'}ms → echo ignored (echo-aware)`)
-          return
-        }
-        if (isEchoAwareToggle()) {
-          // Experiment 8: arm instead of immediate resume — a recent in-app
-          // pause press and a session handoff press are identical here too.
-          // play() cancels the deferred anchor itself when it fires, so the
-          // pending state is left intact for a canceled arm.
-          armConfirmedResume(); return
-        }
-        pendingAnchorPosRef.current = null
-        addLog('pause while placeholder/pending → resume'); void play(); return
-      }
-      addLog('pause while placeholder/pending → ignored (no auto-resume)')
+      // ARENA PORT resilient semantics: a pause press reaching the anchor is
+      // the user's resume intent (the placeholder plays silence; iOS shows ||;
+      // the echo gate has already filtered the hidden echoes upstream).
+      addLog('pause while placeholder/pending → resume (arena port)')
+      void play()
       return
     }
     if (transitionRef.current) { queuedCommandRef.current = 'pause'; addLog('pause queued'); return }
-    // Defer visible anchor to hidden: visible anchor shows || inverted, hidden shows > correctly + keeps session with HOLD_RATE
-    if (document.visibilityState === 'visible' && sourceKindRef.current === 'track') {
-      const pos = media.currentTime
-      frozenPosRef.current = pos; setCurrentTime(pos); setPlaying(false)
-      const vPause = videoRef.current; if (vPause) try { vPause.pause(); vPause.currentTime = pos } catch {}
-      lastOwnPauseAtRef.current = performance.now()
-      try { media.pause(); addLog(`pause deferred media.pause @ ${pos.toFixed(2)}s`) } catch {}
-      pendingAnchorPosRef.current = pos
-      ensureAnchor(trackDurationRef.current || media.duration || 2)
-      publishPosition(trackDurationRef.current || media.duration, pos, HOLD_RATE)
+    // Own action: the anchor swap stops the track — this is OUR pause, never
+    // an external one (the echo-aware external-pause detector relies on it).
+    lastOwnPauseAtRef.current = performance.now()
+    const pos = media.currentTime
+    frozenPosRef.current = pos; setCurrentTime(pos); setPlaying(false)
+    const vPause = videoRef.current
+    if (vPause) try { vPause.pause() } catch {}
+    if (!IS_APPLE_MOBILE) {
+      // ARENA PORT — Windows/desktop freeze hold: NO swap. The element keeps
+      // playing muted at rate ~0 (src untouched), which keeps the session and
+      // sidesteps the desktop src-swap repeat loop. Resumes via the direct
+      // path (volume/rate restored there); a pause press while frozen is
+      // routed to resume by remotePauseOrResume (Chromium derives the icon
+      // from the playing-muted element and sends the play key as "pause").
+      try { media.volume = FROZEN_VOLUME } catch { /* ignore */ }
+      setRate(media, 0)
       try { if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused' } catch {}
-      addLog(`pause deferred (visible) @ ${pos.toFixed(2)}s — will swap to anchor on hidden`)
+      publishPosition(trackDurationRef.current || media.duration, pos, 0)
+      setOwner('frozen')
+      addLog(`windows freeze hold (muted rate~0, no swap) @ ${pos.toFixed(2)}s`)
       return
     }
     transitionRef.current = true
     try {
-      // Own action: the anchor swap stops the track — this is OUR pause, never
-      // an external one (Windows flyout relies on that distinction).
-      lastOwnPauseAtRef.current = performance.now()
-      const pos = media.currentTime
-      frozenPosRef.current = pos; setCurrentTime(pos); setPlaying(false)
-      const vPause = videoRef.current; if (vPause) try { vPause.pause() } catch {}
       ensureAnchor(trackDurationRef.current || media.duration || 2)
       await activateSource('anchor', anchorUrlRef.current, pos)
       addLog(`track → placeholder swap @ ${pos.toFixed(2)}s`)
     } catch (e) { setOwner('idle'); addLog(`placeholder swap failed: ${e}`) }
     finally { transitionRef.current = false; flushQueued() }
-  }, [activateSource, ensureAnchor, flushQueued, armConfirmedResume, play, setOwner, setPlaying, setCurrentTime])
+  }, [activateSource, ensureAnchor, flushQueued, play, setOwner, setPlaying, setCurrentTime])
 
   commandRunnerRef.current = (c) => { if (c === 'play') void play(); else void pause() }
   // In-app ⏯ routes on the REAL playing state, not owner: after a manual
@@ -635,39 +627,36 @@ export function useAudioEngine() {
   // branch — in-app play could never un-pause its own pause.
   const togglePlay = useCallback(() => { if (usePlayerStore.getState().isPlaying) void pause(); else void play() }, [pause, play])
   const remotePauseOrResume = useCallback((press: 'play' | 'pause' = 'play') => {
-    // While placeholder is playing iOS still shows ||, so pause means resume
-    if (sourceKindRef.current === 'anchor' || ownerRef.current === 'anchor') {
-      // Echo-aware: a pause press shortly after an EXTERNAL native pause is
-      // almost certainly the interruption echo (iOS echos its own pause press
-      // to us) — ignore instead of re-asserting our track over the other
-      // source. A play press is never gated: it is a genuine resume request.
-      if (press === 'pause' && isEchoAwareToggle()) {
-        // Rapid-pair rule (primary, device-proven): interruption echo pairs
-        // land inside the same second as our own pause; a human resume
-        // re-press needs ≥1s (icon can't even repaint faster). Blind spot of
-        // the external gate: iOS natively pauses us mid-swap, which the
-        // transition guard swallows — the pair rule needs no evidence.
-        const sinceOwn = performance.now() - lastOwnPauseAtRef.current
-        if (sinceOwn < PAIR_WINDOW_MS) {
-          addLog(`pause press ${Math.round(sinceOwn)}ms after our own pause → echo pair ignored (echo-aware)`)
-          return
-        }
-        const sinceExternal = lastExternalPauseAtRef.current > 0 ? performance.now() - lastExternalPauseAtRef.current : Infinity
-        if (sinceExternal < ECHO_WINDOW_MS) {
-          addLog(`pause press ${Math.round(sinceExternal)}ms after external pause → echo ignored (echo-aware)`)
-          return
-        }
-        // Experiment 8: the first press of a takeover has no evidence yet at
-        // arrival (we were already paused — nothing native to detect it with).
-        // Arm the resume; if iOS pauses our anchor natively in the next
-        // ~350ms (other source claiming focus), cancel and stay conceded.
-        // play() cancels the deferred anchor itself when it fires.
-        if (isEchoAwareToggle()) { armConfirmedResume(); return }
-      }
-      void play(); return
+    // ARENA PORT: BOTH center presses are engine-aware (resilient, pinned) —
+    // the press KIND no longer decides the action; engine reality does.
+    const media = mediaRef.current
+    if (press === 'play') { void play(); return }
+    // Windows freeze hold: the element is still PLAYING (muted, rate~0), so
+    // Chromium derives its play/pause from the ELEMENT — overriding our
+    // declared "paused" (the overlay shows || and routes the PLAY key as
+    // "pause"). A pause press while frozen can therefore only be the user's
+    // resume intent.
+    if (ownerRef.current === 'frozen') { addLog('frozen hold: pause press = resume (Chromium element-derived icon)'); void play(); return }
+    // Parked navigation anchor: paused by intent — a pause press = resume.
+    if (pausedParkRef.current) { addLog('parked anchor: pause press = resume'); void play(); return }
+    // Echo gate (bug 305592, round-8 load-bearing): while hidden, iOS delivers
+    // presses as "pause" regardless of the declared state. With the silent
+    // anchor holding the position, a hidden pause press can only be an echo —
+    // honoring it would swap back to the track = play() DURING an interruption
+    // (the audio-session-steal pattern behind the YouTube tussle).
+    if (document.visibilityState !== 'visible' && sourceKindRef.current === 'anchor') {
+      addLog('echo-gate: pause press while hidden+anchored IGNORED (echo)')
+      return
+    }
+    // Interruption reality: the element is already paused without our request
+    // (a takeover killed our play). Re-anchoring a dead track would wedge —
+    // concede to the other source.
+    if (media && media.paused && sourceKindRef.current === 'track') {
+      addLog('remote pause ignored: element already paused (interrupted reality)')
+      return
     }
     void pause()
-  }, [play, pause, armConfirmedResume])
+  }, [pause, play])
 
   const seek = useCallback((time: number) => {
     const media = mediaRef.current; if (!media) return
@@ -784,6 +773,13 @@ export function useAudioEngine() {
       drainCoalesced(idx, gen)
       return
     }
+    if (!IS_APPLE_MOBILE) {
+      // ARENA PORT: restore any Windows freeze-hold posture before the fresh
+      // load (frozen hold leaves the element muted at rate~0).
+      const st = usePlayerStore.getState()
+      try { el.volume = st.isMuted ? 0 : st.volume } catch { /* ignore */ }
+      setRate(el, 1)
+    }
     const instanceId = queueKey(track)
     // Every tap is fresh — always reset time/duration even for same fileName dupes
     setCurrentTime(0); setDuration(0); trackDurationRef.current = 0
@@ -808,6 +804,9 @@ export function useAudioEngine() {
     const { isPlaying: wasPlaying } = usePlayerStore.getState()
     const shouldAutoplay = wasPlaying || nextGestureRef.current
     nextGestureRef.current = false
+    // ARENA PORT: sticky intent + parked-state reset for the fresh load.
+    playIntentRef.current = shouldAutoplay
+    pausedParkRef.current = false
     addLog(`load [${idx+1}/${q.length}] ${track.name} autoplay=${shouldAutoplay} (wasPlaying=${wasPlaying})`)
     if (shouldAutoplay) {
       try {
@@ -821,6 +820,30 @@ export function useAudioEngine() {
       loadActiveRef.current = false
       pendingNavRef.current = false
       if (gen === loadGenRef.current) settledIndexRef.current = idx
+      if (IS_APPLE_MOBILE) {
+        // ARENA PORT — paused-navigation keep-alive: a loaded-but-silent
+        // element expires the iOS PWA session within seconds. Re-anchor the
+        // NEW track (duration-matched WAV) once its metadata lands; a play
+        // intent makes the real track take over instead of parking.
+        pausedParkRef.current = true
+        const reAnchor = () => {
+          el.removeEventListener('loadedmetadata', reAnchor)
+          const st = usePlayerStore.getState()
+          if (st.currentTrackIndex !== idx) return
+          if (playIntentRef.current) { addLog('parked skip: play intent arrived → track takes over'); void play(); return }
+          void (async () => {
+            try {
+              ensureAnchor(trackDurationRef.current || el.duration || 2)
+              await activateSource('anchor', anchorUrlRef.current, 0)
+              if (!playIntentRef.current) {
+                try { if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused' } catch {}
+                addLog('parked anchor declared paused (one-press resume)')
+              }
+            } catch (e) { addLog(`parked re-anchor failed: ${e}`) }
+          })()
+        }
+        el.addEventListener('loadedmetadata', reAnchor)
+      }
     }
   }, [attachVideo, cleanupVideo, setCurrentTime, setDuration, play])
 
@@ -1135,7 +1158,9 @@ export function useAudioEngine() {
           const pos = frozenPosRef.current
           try {
             publishPosition(dur, pos, HOLD_RATE)
-            if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused'
+            // No-paused posture: the anchor IS playing silence; only a PARKED
+            // anchor (paused by intent) keeps declaring "paused".
+            try { if ('mediaSession' in navigator) navigator.mediaSession.playbackState = pausedParkRef.current ? 'paused' : 'playing' } catch {}
           } catch {}
           addLog(`hidden anchor refresh paused pos=${pos.toFixed(2)} HOLD_RATE`)
           if (vHidden && vHidden.src) try { vHidden.currentTime = pos } catch {}
@@ -1174,7 +1199,7 @@ export function useAudioEngine() {
         if (v && !v.paused) try { v.pause() } catch {}
         if (v && v.src) try { v.currentTime = frozenPosRef.current } catch {}
         publishPosition(trackDurationRef.current || (m?.duration ?? 0), frozenPosRef.current, HOLD_RATE)
-        try { if ('mediaSession' in navigator) navigator.mediaSession.playbackState = getLockPlaybackState('anchor') } catch {}
+        try { if ('mediaSession' in navigator) navigator.mediaSession.playbackState = pausedParkRef.current ? 'paused' : getLockPlaybackState('anchor') } catch {}
         return
       }
       if (ownerRef.current==='track' && m && !m.paused) {

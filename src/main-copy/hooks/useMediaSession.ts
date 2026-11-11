@@ -3,7 +3,7 @@ import { usePlayerStore } from '../stores/playerStore'
 import type { Track, LockScreenMode } from '../lib/types'
 import { getPlayingArtwork } from '../lib/artwork'
 import { addLog } from '../lib/logger'
-import { isLockResilientToggle, isMinimalHandlers, getLockReviveDelay } from '../lib/mediaFlags'
+import { isMinimalHandlers, getLockReviveDelay } from '../lib/mediaFlags'
 
 /*
   Lock screen bridge — single-element freeze (no anchor).
@@ -52,16 +52,15 @@ export function useMediaSession() {
 
     const handlePlay = () => {
       addLog('MediaSession play (center ▶️)')
-      // Resilient mode (default): engine-aware toggle (checks anchor vs track) so an
-      // inverted icon still resumes correctly. Experiment OFF: literal play.
-      // Press kind passed through: echo-aware only gates "pause" presses (the
-      // interruption echo shape) — a play press is always a genuine resume.
-      if (isLockResilientToggle() && remotePauseOrResumeRef.current) remotePauseOrResumeRef.current('play')
+      // ARENA PORT: BOTH center presses are engine-aware, always — the
+      // resilient-toggle flag is retired with the round-8 port (the engine's
+      // remotePauseOrResume decides from engine reality, never press kind).
+      if (remotePauseOrResumeRef.current) remotePauseOrResumeRef.current('play')
       else playRef.current?.()
     }
     const handlePause = () => {
       addLog('MediaSession pause (center ||)')
-      if (isLockResilientToggle() && remotePauseOrResumeRef.current) remotePauseOrResumeRef.current('pause')
+      if (remotePauseOrResumeRef.current) remotePauseOrResumeRef.current('pause')
       else pauseRef.current?.()
     }
     safe('play', handlePlay)
