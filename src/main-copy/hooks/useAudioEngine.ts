@@ -442,29 +442,10 @@ export function useAudioEngine() {
       addLog(`post-publish anchor ${getLockPlaybackState('anchor')} dur=${postDur.toFixed(1)} pos=${frozenPosRef.current.toFixed(2)} rate=${HOLD_RATE} state=${getLockPlaybackState('anchor')}`)
       if (v) try { v.pause(); v.currentTime = frozenPosRef.current } catch {}
     }
-    // Double-publish 120ms later to fix iOS 26.2 where lock icon lags behind setPositionState — now with correct order (publish then state)
-    setTimeout(() => {
-      if (token !== transitionTokenRef.current) return
-      if (sourceKindRef.current === kind) {
-        if (kind === 'track') {
-          const d = media.duration || trackDurationRef.current; publishPosition(d, media.currentTime, 1)
-          try { if ('mediaSession' in navigator) navigator.mediaSession.playbackState = getLockPlaybackState('track') } catch {}
-          addLog(`re-publish track ${getLockPlaybackState('track')} pos=${media.currentTime.toFixed(2)}`)
-        } else {
-          const d = trackDurationRef.current || media.duration; publishPosition(d, frozenPosRef.current, HOLD_RATE)
-          try { if ('mediaSession' in navigator) navigator.mediaSession.playbackState = getLockPlaybackState('anchor') } catch {}
-          addLog(`re-publish anchor ${getLockPlaybackState('anchor')} pos=${frozenPosRef.current.toFixed(2)}`)
-        }
-      }
-    }, 120)
-    // Extra 500ms correction for iOS 26.2 that sometimes inverts first in-app pause
-    setTimeout(() => {
-      if (token !== transitionTokenRef.current) return
-      if (sourceKindRef.current === kind) {
-        try { if ('mediaSession' in navigator) navigator.mediaSession.playbackState = getLockPlaybackState(kind) } catch {}
-        addLog(`500ms correct playbackState ${getLockPlaybackState(kind)}`)
-      }
-    }, 500)
+    // ARENA PORT: publish ONCE after the swap settles. The iOS 26.2-era
+    // 120ms/500ms re-publish timers are retired — on 27.2 extra
+    // playbackState/positionState churn feeds the mismatch loops (round-8
+    // finding), and arena publishes exactly once with clean results.
     addLog(`${kind} source active on permanent element @ ${media.currentTime.toFixed(2)}s${isVideoTrack && kind==='track' ? (v && !v.paused ? ' +video playing' : ' +video paused') : ''} owner=${kind}`)
   }, [setOwner, setPlaying, maybePlayVideo])
 
@@ -539,11 +520,8 @@ export function useAudioEngine() {
         publishPosition(media.duration || trackDurationRef.current, media.currentTime, 1)
         if ('mediaSession' in navigator) navigator.mediaSession.playbackState = getLockPlaybackState('track')
         addLog(`track resumed on permanent element @ ${media.currentTime.toFixed(2)}s rate=1 state=${getLockPlaybackState('track')} direct`)
-        // Corrective re-publish for iOS 26.2
-        setTimeout(() => {
-          publishPosition(media.duration || trackDurationRef.current, media.currentTime, 1)
-          try { if ('mediaSession' in navigator) navigator.mediaSession.playbackState = getLockPlaybackState('track') } catch {}
-        }, 120)
+        // ARENA PORT: no corrective re-publish here (churn retired — arena
+        // publishes once per activation).
       } else {
         // Need src swap — ensure blob URL for track
         let url = blobUrlRef.current

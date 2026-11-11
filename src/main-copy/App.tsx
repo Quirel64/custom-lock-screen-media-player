@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import { Layout } from './components/layout/Layout'
 import { Sidebar } from './components/layout/Sidebar'
 import { AddView } from './components/layout/AddView'
@@ -48,7 +48,7 @@ export default function App() {
       goToTrack(startItemIndex)
     }
   }, [playPlaylist, goToTrack])
-  const { setHandlers, reapplyHandlers, reviveHandlers } = useMediaSession()
+  const { setHandlers, reviveHandlers } = useMediaSession()
 
   useEffect(() => {
     const init = async () => {
@@ -130,17 +130,14 @@ export default function App() {
     }
     document.addEventListener('visibilitychange', onVis)
     return () => document.removeEventListener('visibilitychange', onVis)
-  }, [reapplyHandlers])
+  }, [reviveHandlers])
 
-  // Play-start edge: boot-time registrations happen with no live session, and
-  // iOS can ignore the null-ing then (both sets stay registered = wrong
-  // buttons). Re-applying inside an ACTIVE session forces exactly one set.
+  // ARENA PORT note: the play-start-edge re-apply is RETIRED. Arena never
+  // re-applies handlers on play start and its first lock is clean; the copy's
+  // first-lock triple-tap fits this churn exactly (an in-active-session
+  // re-apply right before the lock). Boot apply + mode toggles still apply.
   const isPlayingForEdge = usePlayerStore((s) => s.isPlaying)
-  const wasPlayingRef = useRef(false)
-  useEffect(() => {
-    if (isPlayingForEdge && !wasPlayingRef.current) reapplyHandlers()
-    wasPlayingRef.current = isPlayingForEdge
-  }, [isPlayingForEdge, reapplyHandlers])
+  void isPlayingForEdge
 
   // Flush libraryTracks to IDB on hide/pagehide — best-effort durability for iOS force-close.
   // libraryTracks is canonical by construction (reconcile + queue helpers), so save as-is.
