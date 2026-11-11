@@ -19,6 +19,10 @@ type Command = "play" | "pause";
 // correctness cannot depend on the rewind firing.
 const HOLD_RATE = 0.000000001;
 
+/** Main-player pipeline floor (useAudioEngine SWAP_FLOOR_MS): minimum spacing
+ *  between real src swaps under navigation spam; extra presses coalesce. */
+const SWAP_FLOOR_MS = 750;
+
 /**
  * Apple-mobile Safari (iPhone/iPad) is the only platform where the PWA
  * session-kill timer makes the silent-anchor keep-alive necessary. Desktop
@@ -94,6 +98,11 @@ export function usePlaybackEngine({ flags }: { flags?: LockFlags } = {}) {
    * arrived as "pause" and needed the reconcile rescue + an extra press).
    */
   const pausedParkRef = useRef(false);
+  // Navigation coalescing pipeline (main-player port, see requestNav).
+  const pendingNavRef = useRef(false);
+  const pendingNavAutoplayRef = useRef(false);
+  const lastSwapAttemptRef = useRef(0);
+  const settledIndexRef = useRef(-1);
   const sourceKindRef = useRef<SourceKind>("track");
   const frozenPosRef = useRef(0);
   const trackDurationRef = useRef(0);
@@ -460,7 +469,17 @@ export function usePlaybackEngine({ flags }: { flags?: LockFlags } = {}) {
       // paused). A pause press here must not "resume" a paused track — that
       // inverted state is what produced the flip-around on device.
       if (pausedParkRef.current) {
-        log("pause ignored: parked-navigation anchor (already paused)");
+        if (document.visibilityState === "visible") {
+          log("pause ignored: parked-navigation anchor (already paused)");
+          return;
+        }
+        // Hidden/lock screen: iOS 27.2 (bug 305592) delivers lock presses as
+        // "pause" regardless of the declared state — with the parked anchor
+        // declared paused, a hidden pause press can only be the user's play
+        // intent. Resume the REAL track directly (main-player resilient
+        // semantics) — restores single-press unpause on the lock screen.
+        log("parked anchor: hidden pause press = resume (echo route)");
+        void play();
         return;
       }
       // iOS still shows || because the placeholder is genuinely playing.
@@ -565,9 +584,14 @@ export function usePlaybackEngine({ flags }: { flags?: LockFlags } = {}) {
   const remotePause = useCallback(() => {
     log(`remote pause (source=${sourceKindRef.current}, owner=${ownerRef.current})`);
 
-    // Windows freeze hold: already held; a pause press would just re-freeze.
+    // Windows freeze hold: the element is still PLAYING (muted, rate~0), so
+    // desktop Chromium derives its play/pause from the ELEMENT — overriding
+    // our declared "paused" (the overlay shows || and routes the PLAY key as
+    // "pause"). A pause press while frozen can therefore only be the user's
+    // resume intent — the main player's resilient-toggle semantics.
     if (ownerRef.current === "frozen") {
-      log("remote pause ignored: frozen hold already active");
+      log("frozen hold: pause press = resume (Chromium element-derived icon)");
+      void play();
       return;
     }
 
@@ -692,9 +716,53 @@ export function usePlaybackEngine({ flags }: { flags?: LockFlags } = {}) {
     [activateSource, attachVideo, detachVideo, ensureAnchor, log, play, setOwner]
   );
 
+  /**
+   * Main-player spam-proofing (coalescing pipeline): the index updates
+   * OPTIMISTICALLY on every press, but the actual src swap is paced by
+   * SWAP_FLOOR_MS. Presses during the floor are coalesced into ONE paced
+   * catch-up serving the FINAL index, so src is never re-hammered at 3 Hz+
+   * (which WebKit punishes by killing the session — the main player ships
+   * exactly this and survived the testers' spam, including backwards).
+   */
+  const requestNav = useCallback(
+    (index: number, autoplay: boolean) => {
+      const list = tracksRef.current;
+      if (list.length === 0) return;
+      const target = ((index % list.length) + list.length) % list.length;
+      // Optimistic index: coalesced spam accumulates to the final index and
+      // the paced catch-up reads indexRef — the main player's exact model.
+      indexRef.current = target;
+      setCurrentIndex(target);
+      const now = performance.now();
+      if (now - lastSwapAttemptRef.current < SWAP_FLOOR_MS) {
+        if (pendingNavRef.current) {
+          log(`nav coalesced → [${target + 1}] (paced catch-up owns it)`);
+          return;
+        }
+        pendingNavRef.current = true;
+        pendingNavAutoplayRef.current = autoplay;
+        const wait = Math.max(0, SWAP_FLOOR_MS - (now - lastSwapAttemptRef.current));
+        log(`nav paced +${Math.round(wait)}ms → [${target + 1}]`);
+        setTimeout(() => {
+          pendingNavRef.current = false;
+          if (indexRef.current !== settledIndexRef.current) {
+            lastSwapAttemptRef.current = performance.now();
+            settledIndexRef.current = indexRef.current;
+            loadIndex(indexRef.current, pendingNavAutoplayRef.current);
+          }
+        }, wait);
+        return;
+      }
+      lastSwapAttemptRef.current = now;
+      settledIndexRef.current = target;
+      loadIndex(target, autoplay);
+    },
+    [loadIndex, log]
+  );
+
   const goToTrack = useCallback(
-    (index: number) => loadIndex(index, ownerRef.current === "track"),
-    [loadIndex]
+    (index: number) => requestNav(index, ownerRef.current === "track"),
+    [requestNav]
   );
 
   const nextTrack = useCallback(() => {
@@ -707,10 +775,10 @@ export function usePlaybackEngine({ flags }: { flags?: LockFlags } = {}) {
       return;
     }
     const next = indexRef.current + 1;
-    if (next < list.length) loadIndex(next, true);
-    else if (repeatRef.current === "all") loadIndex(0, true);
+    if (next < list.length) requestNav(next, true);
+    else if (repeatRef.current === "all") requestNav(0, true);
     else void pause();
-  }, [loadIndex, pause, play, seek]);
+  }, [pause, play, requestNav, seek]);
 
   const prevTrack = useCallback(() => {
     if (frozenPosRef.current > 3) {
@@ -720,11 +788,11 @@ export function usePlaybackEngine({ flags }: { flags?: LockFlags } = {}) {
     const list = tracksRef.current;
     if (list.length === 0) return;
     const prev = indexRef.current - 1;
-    if (prev >= 0) loadIndex(prev, ownerRef.current === "track");
+    if (prev >= 0) requestNav(prev, ownerRef.current === "track");
     else if (repeatRef.current === "all") {
-      loadIndex(list.length - 1, ownerRef.current === "track");
+      requestNav(list.length - 1, ownerRef.current === "track");
     } else seek(0);
-  }, [loadIndex, seek]);
+  }, [requestNav, seek]);
 
   const addFiles = useCallback(
     (fileList: FileList | File[] | null) => {
@@ -745,9 +813,9 @@ export function usePlaybackEngine({ flags }: { flags?: LockFlags } = {}) {
       tracksRef.current = next;
       setTracks(next);
       log(`added ${created.length} track(s): ${created.map((item) => item.name).join(", ")}`);
-      if (wasEmpty) loadIndex(0, false);
+      if (wasEmpty) requestNav(0, false);
     },
-    [loadIndex, log]
+    [log, requestNav]
   );
 
   const removeTrack = useCallback(
@@ -771,13 +839,13 @@ export function usePlaybackEngine({ flags }: { flags?: LockFlags } = {}) {
         setDuration(0);
         detachVideo();
       } else if (removeIndex === indexRef.current) {
-        loadIndex(Math.min(removeIndex, next.length - 1), ownerRef.current === "track");
+        requestNav(Math.min(removeIndex, next.length - 1), ownerRef.current === "track");
       } else if (removeIndex < indexRef.current) {
         indexRef.current -= 1;
         setCurrentIndex(indexRef.current);
       }
     },
-    [detachVideo, loadIndex, setOwner]
+    [detachVideo, requestNav, setOwner]
   );
 
   const clearPlaylist = useCallback(() => {
