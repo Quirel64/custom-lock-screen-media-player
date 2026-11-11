@@ -100,9 +100,18 @@ export function usePlaybackEngine({ flags }: { flags?: LockFlags } = {}) {
   const pausedParkRef = useRef(false);
   // Navigation coalescing pipeline (main-player port, see requestNav).
   const pendingNavRef = useRef(false);
-  const pendingNavAutoplayRef = useRef(false);
   const lastSwapAttemptRef = useRef(0);
   const settledIndexRef = useRef(-1);
+  /**
+   * Sticky play intent: true from the moment play is REQUESTED until a real
+   * pause. ownerRef flips to "idle" for the whole swap window, so it cannot
+   * answer "was the user playing?" mid-spam — regression on device: spam
+   * backwards while playing captured autoplay=false during the idle window,
+   * and the paced catch-up then PARKED the final track (anchor + paused)
+   * instead of playing it. The main player solves this with a sticky
+   * wasPlaying intent in its store; this ref is the same idea.
+   */
+  const playIntentRef = useRef(false);
   const sourceKindRef = useRef<SourceKind>("track");
   const frozenPosRef = useRef(0);
   const trackDurationRef = useRef(0);
@@ -410,6 +419,7 @@ export function usePlaybackEngine({ flags }: { flags?: LockFlags } = {}) {
       return;
     }
     pausedParkRef.current = false;
+    playIntentRef.current = true;
     if (transitionRef.current) {
       queuedCommandRef.current = "play";
       log("play queued behind source swap");
@@ -464,21 +474,14 @@ export function usePlaybackEngine({ flags }: { flags?: LockFlags } = {}) {
   const pause = useCallback(async () => {
     const media = mediaRef.current;
     if (!media) return;
+    playIntentRef.current = false;
     if (sourceKindRef.current === "anchor") {
       // Parked navigation anchor: the track is paused BY INTENT (declared
-      // paused). A pause press here must not "resume" a paused track — that
-      // inverted state is what produced the flip-around on device.
+      // paused). Whatever the press kind, the user-facing truth is paused —
+      // the only sensible reading is "unpause" (main-player resilient
+      // semantics: both center buttons route engine-aware, not literal).
       if (pausedParkRef.current) {
-        if (document.visibilityState === "visible") {
-          log("pause ignored: parked-navigation anchor (already paused)");
-          return;
-        }
-        // Hidden/lock screen: iOS 27.2 (bug 305592) delivers lock presses as
-        // "pause" regardless of the declared state — with the parked anchor
-        // declared paused, a hidden pause press can only be the user's play
-        // intent. Resume the REAL track directly (main-player resilient
-        // semantics) — restores single-press unpause on the lock screen.
-        log("parked anchor: hidden pause press = resume (echo route)");
+        log("parked anchor: pause press = resume");
         void play();
         return;
       }
@@ -598,9 +601,20 @@ export function usePlaybackEngine({ flags }: { flags?: LockFlags } = {}) {
     // Reconcile (see togglePlay): after a takeover without a dispatched pause,
     // the element is ALREADY paused — a lock "pause" press must not freeze into
     // the anchor; it would just re-anchor a dead track.
+    // echoGate ON (interruption testing): keep the interrupted-reality guard —
+    // resuming here would steal the audio session back from the interruptor
+    // (bug 314264 pattern). echoGate OFF (default): a pause press reaching a
+    // paused track can only be the user's unpause intent — resume it. This is
+    // what restores single-press unpause when the engine ends on a paused
+    // track element after spam.
     const media = mediaRef.current;
-    if (media && media.paused && sourceKindRef.current === "track") {
-      log("remote pause ignored: element already paused (interrupted reality)");
+    if (media && media.paused && sourceKindRef.current === "track" && !pausedParkRef.current) {
+      if (flagsRef.current.echoGate) {
+        log("remote pause ignored: element already paused (interrupted reality)");
+        return;
+      }
+      log("remote pause on paused track → resume (user intent, echoGate off)");
+      void play();
       return;
     }
 
@@ -681,6 +695,7 @@ export function usePlaybackEngine({ flags }: { flags?: LockFlags } = {}) {
       setCurrentTime(0);
       setDuration(0);
       trackDurationRef.current = 0;
+      playIntentRef.current = autoplay;
 
       media.autoplay = autoplay;
       media.defaultPlaybackRate = 1;
@@ -706,6 +721,14 @@ export function usePlaybackEngine({ flags }: { flags?: LockFlags } = {}) {
         const reAnchor = () => {
           media.removeEventListener("loadedmetadata", reAnchor);
           if (indexRef.current !== nextIndex) return;
+          // Play intent arrived while the park was pending (e.g. unpause was
+          // the last press before idle) — the user wants SOUND: let the real
+          // track take over instead of parking the anchor under it.
+          if (playIntentRef.current) {
+            log("parked skip: play intent arrived → track takes over");
+            void play();
+            return;
+          }
           ensureAnchor(trackDurationRef.current || media.duration || 2);
           void activateSource("anchor", anchorUrlRef.current, 0);
           log(`paused navigation: fresh track re-anchored at 0 (session keep-alive)`);
@@ -725,7 +748,7 @@ export function usePlaybackEngine({ flags }: { flags?: LockFlags } = {}) {
    * exactly this and survived the testers' spam, including backwards).
    */
   const requestNav = useCallback(
-    (index: number, autoplay: boolean) => {
+    (index: number) => {
       const list = tracksRef.current;
       if (list.length === 0) return;
       const target = ((index % list.length) + list.length) % list.length;
@@ -740,7 +763,6 @@ export function usePlaybackEngine({ flags }: { flags?: LockFlags } = {}) {
           return;
         }
         pendingNavRef.current = true;
-        pendingNavAutoplayRef.current = autoplay;
         const wait = Math.max(0, SWAP_FLOOR_MS - (now - lastSwapAttemptRef.current));
         log(`nav paced +${Math.round(wait)}ms → [${target + 1}]`);
         setTimeout(() => {
@@ -748,20 +770,22 @@ export function usePlaybackEngine({ flags }: { flags?: LockFlags } = {}) {
           if (indexRef.current !== settledIndexRef.current) {
             lastSwapAttemptRef.current = performance.now();
             settledIndexRef.current = indexRef.current;
-            loadIndex(indexRef.current, pendingNavAutoplayRef.current);
+            // Sticky intent read at FIRE time: a play press during the
+            // coalesce window makes the catch-up play, not park.
+            loadIndex(indexRef.current, playIntentRef.current);
           }
         }, wait);
         return;
       }
       lastSwapAttemptRef.current = now;
       settledIndexRef.current = target;
-      loadIndex(target, autoplay);
+      loadIndex(target, playIntentRef.current);
     },
     [loadIndex, log]
   );
 
   const goToTrack = useCallback(
-    (index: number) => requestNav(index, ownerRef.current === "track"),
+    (index: number) => requestNav(index),
     [requestNav]
   );
 
@@ -775,8 +799,8 @@ export function usePlaybackEngine({ flags }: { flags?: LockFlags } = {}) {
       return;
     }
     const next = indexRef.current + 1;
-    if (next < list.length) requestNav(next, true);
-    else if (repeatRef.current === "all") requestNav(0, true);
+    if (next < list.length) requestNav(next);
+    else if (repeatRef.current === "all") requestNav(0);
     else void pause();
   }, [pause, play, requestNav, seek]);
 
@@ -788,9 +812,9 @@ export function usePlaybackEngine({ flags }: { flags?: LockFlags } = {}) {
     const list = tracksRef.current;
     if (list.length === 0) return;
     const prev = indexRef.current - 1;
-    if (prev >= 0) requestNav(prev, ownerRef.current === "track");
+    if (prev >= 0) requestNav(prev);
     else if (repeatRef.current === "all") {
-      requestNav(list.length - 1, ownerRef.current === "track");
+      requestNav(list.length - 1);
     } else seek(0);
   }, [requestNav, seek]);
 
@@ -813,7 +837,7 @@ export function usePlaybackEngine({ flags }: { flags?: LockFlags } = {}) {
       tracksRef.current = next;
       setTracks(next);
       log(`added ${created.length} track(s): ${created.map((item) => item.name).join(", ")}`);
-      if (wasEmpty) requestNav(0, false);
+      if (wasEmpty) requestNav(0);
     },
     [log, requestNav]
   );
@@ -839,7 +863,7 @@ export function usePlaybackEngine({ flags }: { flags?: LockFlags } = {}) {
         setDuration(0);
         detachVideo();
       } else if (removeIndex === indexRef.current) {
-        requestNav(Math.min(removeIndex, next.length - 1), ownerRef.current === "track");
+        requestNav(Math.min(removeIndex, next.length - 1));
       } else if (removeIndex < indexRef.current) {
         indexRef.current -= 1;
         setCurrentIndex(indexRef.current);
