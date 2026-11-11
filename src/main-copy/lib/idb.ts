@@ -289,24 +289,89 @@ export async function getAllFileBlobNames(): Promise<string[]> {
 
 export async function saveTrackFile(fileName: string, file: File): Promise<void> {
   await saveFileBlob(fileName, file)
+  invalidateTrackUrlCache(fileName)
 }
 
 export async function getTrackFile(fileName: string): Promise<File | null> {
   return (await getFileBlob(fileName)) ?? null
 }
 
+/* ============================================================
+   Phase B (round 11): track-URL cache — the gesture-gap fix.
+   The engine awaited IDB for EVERY load, putting an async gap between
+   the gesture (next/prev press) and el.src/el.play(). Arena sets src
+   synchronously (File-derived URLs) and its spam is smooth — the old
+   26.2-era belief that caching blob URLs "loses the PWA gesture" is
+   falsified (rounds 7-8). A cache hit here resolves within the same
+   task, keeping play() in the gesture stack under hidden throttling.
+   Correctness: fileName is unique per import RUN only (delete +
+   re-import can reuse the name with a different file), so every file
+   mutation (save/delete/clear) invalidates its entry. LRU cap keeps
+   memory bounded (~sounding + 2 preloaded adjacent + slack); the
+   sounding URL is never revoked.
+   ============================================================ */
+const TRACK_URL_CACHE_MAX = 5
+const trackUrlCache = new Map<string, string>() // fileName → blob URL (insertion-ordered LRU)
+let activeTrackUrl: string | null = null
+
+/** The engine calls this whenever a derived URL becomes the sounding src. */
+export function setActiveTrackUrl(url: string | null): void { activeTrackUrl = url }
+
+/** Synchronous cache peek — zero await on hit. Refreshes LRU order. */
+export function getCachedTrackUrlSync(fileName: string): string | null {
+  const url = trackUrlCache.get(fileName)
+  if (url === undefined) return null
+  trackUrlCache.delete(fileName)
+  trackUrlCache.set(fileName, url)
+  return url
+}
+
+/** Reverse check: is this blob URL owned by the cache (engine must not revoke it)? */
+export function isCachedTrackUrl(url: string): boolean {
+  for (const u of trackUrlCache.values()) if (u === url) return true
+  return false
+}
+
+function cacheTrackUrl(fileName: string, url: string): void {
+  const prev = trackUrlCache.get(fileName)
+  if (prev !== undefined && prev !== url && prev !== activeTrackUrl) URL.revokeObjectURL(prev)
+  trackUrlCache.delete(fileName)
+  trackUrlCache.set(fileName, url)
+  while (trackUrlCache.size > TRACK_URL_CACHE_MAX) {
+    const oldestKey = trackUrlCache.keys().next().value as string | undefined
+    if (oldestKey === undefined) break
+    const oldestUrl = trackUrlCache.get(oldestKey) as string
+    trackUrlCache.delete(oldestKey)
+    if (oldestUrl !== activeTrackUrl) URL.revokeObjectURL(oldestUrl)
+  }
+}
+
+function invalidateTrackUrlCache(fileName: string): void {
+  const url = trackUrlCache.get(fileName)
+  if (url === undefined) return
+  trackUrlCache.delete(fileName)
+  if (url !== activeTrackUrl) URL.revokeObjectURL(url)
+}
+
 export async function getTrackFileURL(fileName: string): Promise<string | null> {
+  const cached = getCachedTrackUrlSync(fileName)
+  if (cached) return cached
   const file = await getFileBlob(fileName)
   if (!file) return null
-  return URL.createObjectURL(file)
+  const url = URL.createObjectURL(file)
+  cacheTrackUrl(fileName, url)
+  return url
 }
 
 export async function deleteTrackFile(fileName: string): Promise<void> {
   await deleteFileBlob(fileName)
+  invalidateTrackUrlCache(fileName)
 }
 
 export async function clearTrackFiles(): Promise<void> {
   await clearFileBlobs()
+  trackUrlCache.forEach((u) => { if (u !== activeTrackUrl) URL.revokeObjectURL(u) })
+  trackUrlCache.clear()
 }
 
 export async function listTrackFiles(): Promise<string[]> {

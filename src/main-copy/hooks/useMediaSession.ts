@@ -109,6 +109,13 @@ export function useMediaSession() {
 
   // Registration: applies on mount, on mode change, and (unless the Minimal
   // applies experiment says otherwise) on every track change.
+  // ARENA PORT (round 11): one-shot apply at the FIRST loaded track. The
+  // retired play-start-edge reapply was also the copy's only post-refresh
+  // attach path (boot apply lands before iOS has a session to register
+  // against, and minimal-applies skips every track change) — removing it
+  // traded the triple-tap fix for the refresh-attach bug. A single apply at
+  // first load restores attach with bounded churn (once per page load).
+  const firstLoadAppliedRef = useRef(false)
   useEffect(() => {
     // Minimal applies: under the proven snapshot model, the same-set re-apply
     // on each track change only feeds iOS another identical snapshot — skip
@@ -118,9 +125,12 @@ export function useMediaSession() {
     const minimal = isMinimalHandlers()
     const modeChanged = lastAppliedModeRef.current !== lockScreenMode
     lastAppliedModeRef.current = lockScreenMode
-    if (minimal && !modeChanged) {
+    const firstLoad = !!currentTrack && !firstLoadAppliedRef.current
+    if (firstLoad) firstLoadAppliedRef.current = true
+    if (minimal && !modeChanged && !firstLoad) {
       addLog('lockscreen handlers: minimal applies — skip identical re-apply')
     } else {
+      if (firstLoad) addLog('lockscreen handlers: first-load apply (refresh attach, one-shot)')
       applyHandlers(lockScreenMode, currentTrack)
     }
     return () => {

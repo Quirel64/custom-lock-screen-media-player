@@ -2,7 +2,7 @@ import { useRef, useEffect, useCallback, useState } from 'react'
 import { usePlayerStore } from '../stores/playerStore'
 import type { Track } from '../lib/types'
 import { queueKey } from '../lib/queue'
-import { getTrackFileURL } from '../lib/idb'
+import { getTrackFileURL, getCachedTrackUrlSync, isCachedTrackUrl, setActiveTrackUrl } from '../lib/idb'
 import { showError } from '../components/ui/Toast'
 import { addLog } from '../lib/logger'
 import { isVideoPausedMode, isVideoDelayedStart, isLockWarmCycle, getWarmCycleDelay } from '../lib/mediaFlags'
@@ -527,10 +527,10 @@ export function useAudioEngine() {
         let url = blobUrlRef.current
         // If blob was revoked or fileName changed, re-derive
         if (!url || prevFileNameRef.current !== track.fileName) {
-          if (blobUrlRef.current) URL.revokeObjectURL(blobUrlRef.current)
+          if (blobUrlRef.current && !isCachedTrackUrl(blobUrlRef.current)) URL.revokeObjectURL(blobUrlRef.current)
           const fresh = await getTrackFileURL(track.fileName)
           if (!fresh) { showError(`File not found: ${track.fileName}`); throw new Error('no url') }
-          blobUrlRef.current = fresh; url = fresh
+          blobUrlRef.current = fresh; url = fresh; setActiveTrackUrl(fresh)
         }
         // Snapshot the newest request id: a blind retry after AbortError would
         // otherwise swap a STALE track back over whatever superseded it.
@@ -676,6 +676,20 @@ export function useAudioEngine() {
       const m=mediaRef.current; if(m){ frozenPosRef.current=m.currentTime; setPlaying(false); if('mediaSession'in navigator) navigator.mediaSession.playbackState=getLockPlaybackState('anchor'); addLog('end -> frozen keep-alive') } }
   }, [setCurrentTrackIndex, setPlaying, setCurrentTime])
 
+  // Phase B: warm the URL cache with the ADJACENT tracks after each load so
+  // the NEXT next/prev press is a cache-hit zero-await swap even on a first
+  // playthrough (background IDB reads — never awaited by the gesture path).
+  const preloadAdjacent = useCallback((idx: number) => {
+    const q = usePlayerStore.getState().queue
+    for (const i of [idx + 1, idx - 1]) {
+      const t = q[i]
+      if (!t || getCachedTrackUrlSync(t.fileName)) continue
+      void getTrackFileURL(t.fileName)
+        .then((u) => { if (u) addLog(`preload cached [${i + 1}] ${t.name.slice(0, 24)}`) })
+        .catch(() => {})
+    }
+  }, [])
+
   const loadTrack = useCallback(async (idx: number) => {
     // Every tap is a fresh start — even same fileName/instanceId dupes (simplifies playlist dupes)
     frozenPosRef.current = 0
@@ -725,17 +739,22 @@ export function useAudioEngine() {
     transitionRef.current = false; queuedCommandRef.current = null
 
     cleanupVideo()
-    // Revoke old blob URL to free memory — always derive fresh to avoid stale blob accumulation
-    if (blobUrlRef.current) URL.revokeObjectURL(blobUrlRef.current)
+    // Phase B: only revoke URLs the cache doesn't own — cached URLs live until
+    // eviction (revoking them would kill a future cache hit mid-playback).
+    if (blobUrlRef.current && !isCachedTrackUrl(blobUrlRef.current)) URL.revokeObjectURL(blobUrlRef.current)
     blobUrlRef.current = null
 
-    // Derive fresh blob URL each time — IndexedDB is async and loses PWA gesture if cached
-    const url = await getTrackFileURL(track.fileName)
+    // Phase B (round 11): cache-first URL. On a hit this is fully SYNCHRONOUS
+    // (zero await between gesture and src) — matching arena's zero-await swap
+    // stack; a miss still derives via IDB and seeds the cache for next time.
+    const cachedUrl = getCachedTrackUrlSync(track.fileName)
+    const url = cachedUrl ?? await getTrackFileURL(track.fileName)
+    if (cachedUrl) addLog(`load url: cache hit (zero-await) ${track.fileName.slice(0, 28)}`)
     if (gen !== loadGenRef.current) {
       // A newer FULL load owns the future — it drains. Just stand down.
       loadActiveRef.current = false
       addLog(`load [${idx + 1}] stale gen ${gen} abandoned`)
-      if (url) URL.revokeObjectURL(url)
+      if (url && !isCachedTrackUrl(url)) URL.revokeObjectURL(url)
       return
     }
     if (!url) {
@@ -745,6 +764,7 @@ export function useAudioEngine() {
       return
     }
     blobUrlRef.current = url
+    setActiveTrackUrl(url)
     const el = mediaRef.current
     if (!el) {
       loadActiveRef.current = false
@@ -786,6 +806,7 @@ export function useAudioEngine() {
     playIntentRef.current = shouldAutoplay
     pausedParkRef.current = false
     addLog(`load [${idx+1}/${q.length}] ${track.name} autoplay=${shouldAutoplay} (wasPlaying=${wasPlaying})`)
+    preloadAdjacent(idx)
     if (shouldAutoplay) {
       try {
         await play()
@@ -823,7 +844,7 @@ export function useAudioEngine() {
         el.addEventListener('loadedmetadata', reAnchor)
       }
     }
-  }, [attachVideo, cleanupVideo, setCurrentTime, setDuration, play])
+  }, [attachVideo, cleanupVideo, preloadAdjacent, setCurrentTime, setDuration, play])
 
   // Catch-up drain for coalesced navigation: after a load completes, serve the
   // final index — paced through the same floor (an immediate rerun would
@@ -975,7 +996,13 @@ export function useAudioEngine() {
         addLog('external native pause detected (echo-aware)')
       }
       // Only treat pause as real pause when track was playing; anchor pause is expected to be playing silent
-      if (sourceKindRef.current==='track' && ownerRef.current==='track') { setPlaying(false); try { if ('mediaSession' in navigator) navigator.mediaSession.playbackState = getLockPlaybackState('anchor') } catch {} }
+      // ARENA PORT parity (round 11 tussle fix): arena's onPause NEVER writes
+      // playbackState. The copy's write here re-asserted "playing" from inside
+      // an interruption (the port made it unconditional 'playing') — a
+      // declared-vs-element mismatch claim that feeds iOS's reconcile echo,
+      // which dispatches play() and steals the session back from the takeover
+      // = the track-repeatedly-overrides-YouTube tussle. Store flip only.
+      if (sourceKindRef.current==='track' && ownerRef.current==='track') setPlaying(false)
       addLog(`native pause (${sourceKindRef.current})`)
     }
     const onTimeUpdate = () => {
@@ -1254,10 +1281,13 @@ export function useAudioEngine() {
           // The URL stays alive exactly like a loadTrack-derived one (revoked
           // on the next loadTrack, after its element is destroyed first).
           blobUrlRef.current = url
+          setActiveTrackUrl(url)
           prevFileNameRef.current = t.fileName
           attachVideo(url)
         } else {
-          URL.revokeObjectURL(url)
+          // Phase B: the derived URL is cache-owned now — revoking it here
+          // would poison the cache entry (dead blob on a later hit). Leave it;
+          // LRU eviction revokes when it ages out.
         }
         addLog(`boot probe: track 1/${queue.length} staged (element untouched)`)
       })()
