@@ -390,6 +390,15 @@ export function useAudioEngine() {
     } catch (e) {
       // iOS PWA may reject if not in gesture — log and re-throw for retry in caller
       addLog(`${kind} play() rejected: ${e}`)
+      // Round 16: NotAllowedError = the element lacks activation AND the call
+      // ran outside a gesture stack (e.g. the post-rebuild reload, or the
+      // recovery load). NOT a pipeline wedge — counting it as a swap failure
+      // triggered pointless extra rebuilds and left the engine wedged-looking.
+      // Any user press (a gesture) plays the loaded track.
+      if (e instanceof DOMException && e.name === 'NotAllowedError') {
+        swapFailsRef.current = 0
+        throw e
+      }
       if (e instanceof DOMException && e.name === 'NotSupportedError') {
         // Wedged pipeline (error state persists across swaps and eventually
         // costs the session): hard-reset so the next swap starts clean. The
@@ -715,6 +724,18 @@ export function useAudioEngine() {
     if (typeof document !== 'undefined' && document.hidden && swapFailsRef.current >= 2) {
       hiddenRecoveryRef.current = hiddenRecoveryRef.current === 'rebuild' ? 'rebuild' : 'standdown'
       pendingNavRef.current = true
+      // Round 16: the metadata push below already advertised the NEW track —
+      // with the swap blocked, the lock would show the new name over the old
+      // element's audio/duration (the "stuck track" mismatch). Revert the
+      // metadata to the SETTLED track so the lock always describes what the
+      // element is actually playing.
+      const settled = q[settledIndexRef.current]
+      if (settled && settled.id !== track.id) {
+        try {
+          if ('mediaSession' in navigator) navigator.mediaSession.metadata = new MediaMetadata({ title: settled.name, artist: settled.artist || 'Unknown Artist', album: settled.album || 'Unknown Album' })
+          addLog(`stand-down: metadata reverted to settled track (lock matches element)`)
+        } catch { /* ignore */ }
+      }
       addLog(`swap stand-down (hidden, ${swapFailsRef.current} consecutive fails) — recovery on visible`)
       return
     }
@@ -1121,13 +1142,20 @@ export function useAudioEngine() {
     mediaRef.current = fresh
     wireMediaElement(fresh)
     setAudioSessionType()
+    // Round 16: a FRESH element has no activation history — autoplay outside a
+    // gesture stack is denied (NotAllowedError, device-proven 21:35 logs).
+    // Park the reload instead: the track loads silent and declared paused
+    // (parked re-anchor keeps the session), and the user's next press resumes
+    // it with a real gesture. This replaces the stuck silent-after-rebuild
+    // state that needed a manual pause+unpause.
+    setPlaying(false)
     const st = usePlayerStore.getState()
     if (st.queue.length > 0 && st.queue[st.currentTrackIndex]) {
       // Reload current index fresh on the new element (loadTrack respects
       // paused vs playing, so no surprise playback).
       setLoadForce((v) => v + 1)
     }
-  }, [makeMediaElement, wireMediaElement, setOwner])
+  }, [makeMediaElement, wireMediaElement, setOwner, setPlaying])
 
   useEffect(() => {
     const nav = navigator as Navigator & { standalone?: boolean }
