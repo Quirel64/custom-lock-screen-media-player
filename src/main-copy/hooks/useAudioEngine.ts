@@ -1163,9 +1163,13 @@ export function useAudioEngine() {
           const pos = frozenPosRef.current
           try {
             publishPosition(dur, pos, HOLD_RATE)
-            // No-paused posture: the anchor IS playing silence; only a PARKED
-            // anchor (paused by intent) keeps declaring "paused".
-            try { if ('mediaSession' in navigator) navigator.mediaSession.playbackState = pausedParkRef.current ? 'paused' : 'playing' } catch {}
+            // Round 13 (arena parity): the non-parked 'playing' re-write is
+            // RETIRED. 27.x playbackState writes are native claims
+            // (clientWillBeginPlayback — bug 305592 research note), and the
+            // state was already declared at anchor activation; re-writing it
+            // at hide time is redundant churn. The PARKED case keeps its
+            // 'paused' declaration (the one-press-resume contract).
+            if (pausedParkRef.current) { try { if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused' } catch {} }
           } catch {}
           addLog(`hidden anchor refresh paused pos=${pos.toFixed(2)} HOLD_RATE`)
           if (vHidden && vHidden.src) try { vHidden.currentTime = pos } catch {}
@@ -1178,8 +1182,13 @@ export function useAudioEngine() {
           const dur = mediaRef.current?.duration || trackDurationRef.current || 0
           const pos = mediaRef.current?.currentTime || 0
           try {
+            // Round 13 (arena parity): NO playbackState write on hide — the
+            // state was already declared at track activation, and a hide-time
+            // 'playing' write is a NATIVE playback claim
+            // (clientWillBeginPlayback) issued exactly while the takeover
+            // hands the session off = the 1-interruption delta. Arena's hide
+            // handler writes nothing at all.
             publishPosition(dur, pos, 1)
-            if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing'
           } catch {}
           addLog(`hidden track refresh playing pos=${pos.toFixed(2)}`)
           // Keep video paused while hidden (audio continues), will seek on visible
