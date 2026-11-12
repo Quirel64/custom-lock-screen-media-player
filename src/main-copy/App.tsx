@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { Layout } from './components/layout/Layout'
 import { Sidebar } from './components/layout/Sidebar'
 import { AddView } from './components/layout/AddView'
@@ -48,7 +48,7 @@ export default function App() {
       goToTrack(startItemIndex)
     }
   }, [playPlaylist, goToTrack])
-  const { setHandlers, reviveHandlers } = useMediaSession()
+  const { setHandlers, reapplyHandlers, reviveHandlers } = useMediaSession()
 
   useEffect(() => {
     const init = async () => {
@@ -132,12 +132,21 @@ export default function App() {
     return () => document.removeEventListener('visibilitychange', onVis)
   }, [reviveHandlers])
 
-  // ARENA PORT note: the play-start-edge re-apply is RETIRED. Arena never
-  // re-applies handlers on play start and its first lock is clean; the copy's
-  // first-lock triple-tap fits this churn exactly (an in-active-session
-  // re-apply right before the lock). Boot apply + mode toggles still apply.
+  // ARENA PORT (round 12): one-shot attach at the FIRST play per page load.
+  // The refresh hole: after a refresh the boot/first-load applies land before
+  // iOS has a session to register against, so the handler set is dropped —
+  // the first PLAY is the first gesture-adjacent moment iOS accepts a fresh
+  // set. Unlike the retired per-unpause edge apply (the triple-tap churn),
+  // this fires at most once per page load, so churn stays bounded.
   const isPlayingForEdge = usePlayerStore((s) => s.isPlaying)
-  void isPlayingForEdge
+  const firstPlayAppliedRef = useRef(false)
+  useEffect(() => {
+    if (isPlayingForEdge && !firstPlayAppliedRef.current) {
+      firstPlayAppliedRef.current = true
+      addLog('first-play one-shot handler apply (refresh attach)')
+      reapplyHandlers()
+    }
+  }, [isPlayingForEdge, reapplyHandlers])
 
   // Flush libraryTracks to IDB on hide/pagehide — best-effort durability for iOS force-close.
   // libraryTracks is canonical by construction (reconcile + queue helpers), so save as-is.

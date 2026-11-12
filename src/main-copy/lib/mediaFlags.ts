@@ -110,8 +110,15 @@ export function setLockReviveDelay(ms: number): void {
 // of churn). Boot, mode toggles, play-start edge and the hidden flip still
 // apply. A/B'd against lock-revive-on-hidden.
 const MINIMAL_KEY = 'minimal-handlers'
+// Round 12: default FLIPPED to false. Device evidence (round 11 testing):
+// with minimal ON, the handler set does NOT survive a track change on
+// iOS 27.2 — the lock buttons grey out on the tap, and an interruption that
+// arrives with handlers missing gets answered by iOS's NATIVE default
+// play/pause acting directly on our element (= the "1 interruption" delta vs
+// arena, which always has handlers attached). Per-track re-apply is required;
+// the triple-tap churn was the play-start-edge apply (now retired), not this.
 export function isMinimalHandlers(): boolean {
-  return readFlag(MINIMAL_KEY, true)
+  return readFlag(MINIMAL_KEY, false)
 }
 
 export function setMinimalHandlers(on: boolean): void {
