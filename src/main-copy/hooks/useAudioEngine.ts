@@ -707,6 +707,17 @@ export function useAudioEngine() {
     if (m && !m.paused) { try { m.currentTime = 0 } catch {} }
     const { queue: q } = usePlayerStore.getState()
     const track = q[idx]; if (!track) return
+    // Round 15: hidden stand-down — with 2+ consecutive swap failures while
+    // hidden, STOP attempting swaps: each retry deepens the wedge, and the
+    // failure storm is what cost sessions (small-library sustained spam). The
+    // index change stays pending and is served on visible via the recovery
+    // branch (rebuild first if one was deferred).
+    if (typeof document !== 'undefined' && document.hidden && swapFailsRef.current >= 2) {
+      hiddenRecoveryRef.current = hiddenRecoveryRef.current === 'rebuild' ? 'rebuild' : 'standdown'
+      pendingNavRef.current = true
+      addLog(`swap stand-down (hidden, ${swapFailsRef.current} consecutive fails) — recovery on visible`)
+      return
+    }
     // Coalesce: a swap is running, or the last one started less than a floor
     // interval ago — move the index (already done by caller) but let one paced
     // catch-up serve the final index. Without the floor, back-to-back swaps
@@ -1065,11 +1076,23 @@ export function useAudioEngine() {
   // is wedged (error state persists — only a force-close used to help). Rebuild
   // it fresh in place (same recipe as boot; blob URLs survive, same document),
   // then reload the current index. Cooldown-guarded against rebuild loops.
+  // Round 15: NEVER rebuild while hidden — destroying the session-owning
+  // element is exactly what killed the session (small-library sustained-spam
+  // death: play() timeouts → hidden rebuild → dead session on return). The
+  // wedged element keeps holding the (stale) session until visible; the
+  // deferred rebuild then recovers in front of the user.
   const rebuildCountRef = useRef(0)
   const swapFailsRef = useRef(0)
   const lastRebuildAtRef = useRef(0)
+  // 'rebuild' = deferred rebuild armed; 'standdown' = hidden swaps stopped.
+  const hiddenRecoveryRef = useRef<'none' | 'rebuild' | 'standdown'>('none')
   const noteSwapSuccess = useCallback(() => { swapFailsRef.current = 0 }, [])
   const rebuildMediaElement = useCallback(() => {
+    if (typeof document !== 'undefined' && document.hidden) {
+      hiddenRecoveryRef.current = 'rebuild'
+      addLog('rebuild deferred (hidden) — session survives; recovery on visible')
+      return
+    }
     const now = performance.now()
     if (now - lastRebuildAtRef.current < 30000) {
       addLog('rebuild skipped (cooldown) — pipeline still failing')
@@ -1197,6 +1220,18 @@ export function useAudioEngine() {
         return
       }
       setAudioSessionType()
+      // Round 15: hidden recovery — serve whatever the stand-down deferred
+      // (rebuild first if armed, then the pending index catch-up via the
+      // rebuild's own reload / a direct loadTrack).
+      if (hiddenRecoveryRef.current !== 'none') {
+        const mode = hiddenRecoveryRef.current
+        hiddenRecoveryRef.current = 'none'
+        pendingNavRef.current = false
+        addLog(`hidden recovery on visible: ${mode}`)
+        if (mode === 'rebuild') { rebuildMediaElement(); return }
+        void loadTrack(usePlayerStore.getState().currentTrackIndex)
+        return
+      }
       const m=mediaRef.current; const v=videoRef.current
       const isVideo = usePlayerStore.getState().queue[usePlayerStore.getState().currentTrackIndex]?.mediaType === 'video'
       if (pendingAnchorPosRef.current !== null) {
@@ -1235,7 +1270,7 @@ export function useAudioEngine() {
     const onPageShow = (e: PageTransitionEvent) => { setAudioSessionType(); addLog(`pageshow${(e as unknown as { persisted?: boolean }).persisted?' (bfcache)':''}`) }
     document.addEventListener('visibilitychange', onVis); window.addEventListener('pageshow', onPageShow as EventListener)
     return () => { document.removeEventListener('visibilitychange', onVis); window.removeEventListener('pageshow', onPageShow as EventListener) }
-  }, [activateSource, ensureAnchor, setPlaying, maybePlayVideo])
+  }, [activateSource, ensureAnchor, rebuildMediaElement, loadTrack, setPlaying, maybePlayVideo])
 
   useEffect(() => {
     // loadForce is a monotonic signal (goToTrack bumps per tap); resetting it
