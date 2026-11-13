@@ -390,38 +390,53 @@ export function useAudioEngine() {
     } catch (e) {
       // iOS PWA may reject if not in gesture — log and re-throw for retry in caller
       addLog(`${kind} play() rejected: ${e}`)
-      // Round 16: NotAllowedError = the element lacks activation AND the call
-      // ran outside a gesture stack (e.g. the post-rebuild reload, or the
-      // recovery load). NOT a pipeline wedge — counting it as a swap failure
-      // triggered pointless extra rebuilds and left the engine wedged-looking.
-      // Any user press (a gesture) plays the loaded track.
-      if (e instanceof DOMException && e.name === 'NotAllowedError') {
+      // Round 17: a play() TIMEOUT under hidden spam is not proof of failure —
+      // the promise resolution is starved by the handler/metadata churn while
+      // the element actually plays (device log 11:15:54: "play() timed out"
+      // rejected, then "native playing (track, same element)" immediately
+      // after). src was already set (line above), so if the element is
+      // sounding, treat as success: no fail count, no stand-down, and the
+      // post-publish below publishes the CORRECT duration — the stale-token
+      // abandon that previously followed a timeout was half of the sticky
+      // track (new name + old duration on the lock).
+      const timedOut = e instanceof Error && /timed out/.test(e.message)
+      if (timedOut && !media.paused && !media.ended) {
         swapFailsRef.current = 0
+        addLog('play() promise starved but element sounding — counted as success')
+      } else {
+        // Round 16: NotAllowedError = the element lacks activation AND the call
+        // ran outside a gesture stack (e.g. the post-rebuild reload, or the
+        // recovery load). NOT a pipeline wedge — counting it as a swap failure
+        // triggered pointless extra rebuilds and left the engine wedged-looking.
+        // Any user press (a gesture) plays the loaded track.
+        if (e instanceof DOMException && e.name === 'NotAllowedError') {
+          swapFailsRef.current = 0
+          throw e
+        }
+        if (e instanceof DOMException && e.name === 'NotSupportedError') {
+          // Wedged pipeline (error state persists across swaps and eventually
+          // costs the session): hard-reset so the next swap starts clean. The
+          // guarded caller retry re-sets src ~120-500ms later.
+          try {
+            media.removeAttribute('src')
+            media.load()
+          } catch {
+            /* ignore */
+          }
+          addLog('media element hard-reset after NotSupportedError')
+        }
+        // Three consecutive swap failures = wedged element (only a force-close
+        // used to recover). Rebuild it; the guarded retry then runs fresh.
+        if (++swapFailsRef.current >= 3) {
+          addLog(`${swapFailsRef.current} consecutive swap failures — rebuilding element`)
+          try {
+            rebuildMediaElement()
+          } catch {
+            /* ignore */
+          }
+        }
         throw e
       }
-      if (e instanceof DOMException && e.name === 'NotSupportedError') {
-        // Wedged pipeline (error state persists across swaps and eventually
-        // costs the session): hard-reset so the next swap starts clean. The
-        // guarded caller retry re-sets src ~120-500ms later.
-        try {
-          media.removeAttribute('src')
-          media.load()
-        } catch {
-          /* ignore */
-        }
-        addLog('media element hard-reset after NotSupportedError')
-      }
-      // Three consecutive swap failures = wedged element (only a force-close
-      // used to recover). Rebuild it; the guarded retry then runs fresh.
-      if (++swapFailsRef.current >= 3) {
-        addLog(`${swapFailsRef.current} consecutive swap failures — rebuilding element`)
-        try {
-          rebuildMediaElement()
-        } catch {
-          /* ignore */
-        }
-      }
-      throw e
     }
     if (token !== transitionTokenRef.current) {
       // Stale: still ensure lock shows correct final kind for the newer token
@@ -732,7 +747,10 @@ export function useAudioEngine() {
       const settled = q[settledIndexRef.current]
       if (settled && settled.id !== track.id) {
         try {
-          if ('mediaSession' in navigator) navigator.mediaSession.metadata = new MediaMetadata({ title: settled.name, artist: settled.artist || 'Unknown Artist', album: settled.album || 'Unknown Album' })
+          // Round 17: include the app-icon artwork — the artwork-less revert
+          // was wiping the lock icon (the "icon gone for a bit" at sticky onset).
+          const art = getPlayingArtwork()
+          if ('mediaSession' in navigator) navigator.mediaSession.metadata = new MediaMetadata({ title: settled.name, artist: settled.artist || 'Unknown Artist', album: settled.album || 'Unknown Album', artwork: [{ src: art, sizes: '300x300', type: 'image/svg+xml' }] })
           addLog(`stand-down: metadata reverted to settled track (lock matches element)`)
         } catch { /* ignore */ }
       }
@@ -839,13 +857,22 @@ export function useAudioEngine() {
     pausedParkRef.current = false
     addLog(`load [${idx+1}/${q.length}] ${track.name} autoplay=${shouldAutoplay} (wasPlaying=${wasPlaying})`)
     preloadAdjacent(idx)
+    // Round 17: settledIndexRef must be AUTHORITATIVE — only a swap that
+    // actually landed on the element may mark it settled. Previously the drain
+    // marked settled even after a failed play(), so (a) the catch-up skip
+    // check believed a never-played index was settled, and (b) the round-16
+    // stand-down metadata revert targeted the FAILED index — re-pushing the
+    // sticky name instead of the sounding track (the revert fired but fixed
+    // nothing, exactly as the 11:35 logs show).
+    let playOk = false
     if (shouldAutoplay) {
       try {
         await play()
+        playOk = true
       } catch {
-        /* play() logs + guards itself; drain below still settles */
+        /* play() logs + guards itself; drain below still runs */
       }
-      await drainCoalesced(idx, gen)
+      await drainCoalesced(idx, gen, playOk)
     } else {
       el.src = url; el.load()
       loadActiveRef.current = false
@@ -882,13 +909,15 @@ export function useAudioEngine() {
   // final index — paced through the same floor (an immediate rerun would
   // defeat it). Gen-guarded so a newer full load (which owns the future)
   // never double-runs.
-  async function drainCoalesced(finishedIdx: number, finishedGen: number): Promise<void> {
+  async function drainCoalesced(finishedIdx: number, finishedGen: number, playOk = false): Promise<void> {
     loadActiveRef.current = false
     const curIdx = usePlayerStore.getState().currentTrackIndex
     const need = (pendingNavRef.current || curIdx !== finishedIdx) && finishedGen === loadGenRef.current
     pendingNavRef.current = false
     if (!need) {
-      if (finishedGen === loadGenRef.current) settledIndexRef.current = finishedIdx
+      // Round 17: playOk gates the settle mark — a failed swap never happened
+      // on the element, so the PREVIOUS settled index stays authoritative.
+      if (finishedGen === loadGenRef.current && playOk) settledIndexRef.current = finishedIdx
       return
     }
     const wait = SWAP_FLOOR_MS - (performance.now() - lastSwapAttemptRef.current)
