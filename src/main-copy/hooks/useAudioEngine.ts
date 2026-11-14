@@ -57,6 +57,14 @@ const FALLBACK_HOLD_RATE = 0.0625
    but no longer change these behaviors.
    ============================================================ */
 const OWN_PAUSE_ECHO_MS = 1500
+/** Round 19: how long after a detected external pause a hidden pause-press is
+ *  still treated as an interruption echo rather than user unpause intent. The
+ *  echo (bug 305592 auto-dispatch) fires at takeover time; the window only
+ *  needs to cover that moment. Tuned on device — if an echo ever lands outside
+ *  this window (log line 'echo-gate: no echo context' during a takeover),
+ *  lengthen it; if a real unpause gets swallowed right after an interruption,
+ *  shorten it. */
+const ECHO_PRESS_WINDOW_MS = 10000
 /** Desktop/Windows freeze hold: element keeps playing muted at rate ~0. */
 const FROZEN_VOLUME = 0.001
 
@@ -642,12 +650,27 @@ export function useAudioEngine() {
     // Parked navigation anchor: paused by intent — a pause press = resume.
     if (pausedParkRef.current) { addLog('parked anchor: pause press = resume'); void play(); return }
     // Echo gate (bug 305592, round-8 load-bearing): while hidden, iOS delivers
-    // presses as "pause" regardless of the declared state. With the silent
-    // anchor holding the position, a hidden pause press can only be an echo —
-    // honoring it would swap back to the track = play() DURING an interruption
-    // (the audio-session-steal pattern behind the YouTube tussle).
+    // presses as "pause" regardless of the declared state. Round 19 REFINEMENT
+    // (device logs 16:45/16:36): the unconditional swallow also ate the user's
+    // genuine UNPAUSE intent (pause-press while parked = the only way to resume
+    // from outside the app — five consecutive IGNORED lines on real presses),
+    // and the double-tap workaround proved a hidden resume via a session press
+    // is fully gesture-safe (`MediaSession play` → complete track resume while
+    // hidden). So echo context must be EVIDENCE-BASED, not assumed:
+    // - an external native pause detected recently = interruption reality →
+    //   the press is an echo → ignore (YouTube-tussle protection preserved);
+    // - the element natively paused = same, regardless of detection order;
+    // - otherwise (our silent anchor alive, nothing interrupted us) a hidden
+    //   pause press can only be the user's resume intent → honor it.
     if (document.visibilityState !== 'visible' && sourceKindRef.current === 'anchor') {
-      addLog('echo-gate: pause press while hidden+anchored IGNORED (echo)')
+      const sinceExternal = performance.now() - lastExternalPauseAtRef.current
+      const echoContext = lastExternalPauseAtRef.current > 0 && sinceExternal < ECHO_PRESS_WINDOW_MS
+      if (echoContext || (media && media.paused)) {
+        addLog(`echo-gate: pause press while hidden+anchored IGNORED (echo${echoContext ? `: external pause ${Math.round(sinceExternal)}ms ago` : ': element natively paused'})`)
+        return
+      }
+      addLog('echo-gate: no echo context — hidden pause press = user unpause intent → resume')
+      void play()
       return
     }
     // Interruption reality: the element is already paused without our request
