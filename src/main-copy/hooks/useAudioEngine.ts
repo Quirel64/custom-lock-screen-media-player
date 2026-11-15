@@ -75,6 +75,11 @@ const CROSS_APP_PAIR_MS = 2000
  *  is still attributed to us — must cover promise starvation lag (device-proven:
  *  a boot play() can start the element ~2s after the press). */
 const OWN_PLAY_ECHO_MS = 5000
+/** Round 22: an interruption echo burst always follows our own park within
+ *  ~1-2s (the park itself was the first echo being honored). A pause press
+ *  reaching the parked anchor inside this window is burst continuation, not a
+ *  user unpause — legit unpause presses come later (device: 60s). */
+const ECHO_BURST_MS = 4000
 /** Desktop/Windows freeze hold: element keeps playing muted at rate ~0. */
 const FROZEN_VOLUME = 0.001
 
@@ -604,15 +609,48 @@ export function useAudioEngine() {
           }
         }
       }
-    } catch (e) { setPlaying(false); setOwner('idle'); addLog(`resume failed: ${e}`) }
+    } catch (e) {
+      setPlaying(false); setOwner('idle'); addLog(`resume failed: ${e}`)
+      // Round 22: an aborted/stalled resume can leave the element paused on
+      // the TRACK src with the anchor gone (the swap path destroys the anchor;
+      // device log 19:47: AbortError mid-swap = the guaranteed failure state —
+      // a paused non-playing element expires the iOS session in ~30s). While
+      // hidden, re-park the keep-alive anchor. Visible, leave it for the user
+      // (one press plays).
+      if (IS_APPLE_MOBILE && typeof document !== 'undefined' && document.hidden) {
+        const mFailed = mediaRef.current
+        if (mFailed && mFailed.paused) {
+          try {
+            ensureAnchor(trackDurationRef.current || mFailed.duration || 2)
+            void activateSource('anchor', anchorUrlRef.current, frozenPosRef.current)
+            addLog('resume failed while hidden → re-parked keep-alive anchor')
+          } catch { /* ignore */ }
+        }
+      }
+    }
     finally { transitionRef.current = false; flushQueued() }
-  }, [activateSource, currentTrack, flushQueued, setOwner, setPlaying, maybePlayVideo])
+  }, [activateSource, currentTrack, ensureAnchor, flushQueued, setOwner, setPlaying, maybePlayVideo])
 
   const pause = useCallback(async () => {
     const media = mediaRef.current
     if (!media) return
     playIntentRef.current = false
     if (sourceKindRef.current === 'anchor' || pendingAnchorPosRef.current !== null) {
+      // Round 22: echo-aware resume gate. This branch serves the legit
+      // unpause (16:26 device log: pause press 60s after the user's own
+      // pause). But iOS also dispatches pause actions HERE during
+      // interruption bursts — 19:34/19:47: an echo arrived 1-2s after our own
+      // park, this branch resumed blindly, iOS aborted the swap mid-flight
+      // (AbortError) and left the broken parked state (anchor destroyed,
+      // element paused on the track src, no keep-alive = the guaranteed
+      // failure state). A pause press arriving within the burst window of our
+      // OWN pause is interruption continuation, not user intent.
+      const sinceOwnPause = performance.now() - lastOwnPauseAtRef.current
+      if (lastOwnPauseAtRef.current > 0 && sinceOwnPause < ECHO_BURST_MS) {
+        lastIgnoredPausePressAtRef.current = performance.now()
+        addLog(`pause-press while parked ${Math.round(sinceOwnPause)}ms after our own pause — echo burst, ignored`)
+        return
+      }
       // ARENA PORT resilient semantics: a pause press reaching the anchor is
       // the user's resume intent (the placeholder plays silence; iOS shows ||;
       // the echo gate has already filtered the hidden echoes upstream).
