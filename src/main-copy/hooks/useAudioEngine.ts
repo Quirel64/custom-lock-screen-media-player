@@ -65,6 +65,12 @@ const OWN_PAUSE_ECHO_MS = 1500
  *  lengthen it; if a real unpause gets swallowed right after an interruption,
  *  shorten it. */
 const ECHO_PRESS_WINDOW_MS = 10000
+/** Round 20: how long after an IGNORED pause press a play press is treated as
+ *  the second half of iOS's cross-app pause→play reconcile pair (dispatched to
+ *  our session when another app's playback begins — device-proven 14:11 clip).
+ *  The pair lands within the same second; 2s gives margin without swallowing a
+ *  deliberate pause→resume re-press. */
+const CROSS_APP_PAIR_MS = 2000
 /** Desktop/Windows freeze hold: element keeps playing muted at rate ~0. */
 const FROZEN_VOLUME = 0.001
 
@@ -140,6 +146,10 @@ export function useAudioEngine() {
   // external native pause event (no own action within OWN_PAUSE_ECHO_MS).
   const lastOwnPauseAtRef = useRef(0)
   const lastExternalPauseAtRef = useRef(0)
+  // Round 20: timestamp of the last pause press we IGNORED (echo gate /
+  // interrupted reality) — a play press arriving within CROSS_APP_PAIR_MS of
+  // it is iOS's cross-app pause→play pair, not user intent.
+  const lastIgnoredPausePressAtRef = useRef(0)
   // Experiment 7 guard: the synthetic pause→play warm pair must not flip
   // store state or feed the external-pause detector.
   const warmCycleRef = useRef(false)
@@ -640,7 +650,26 @@ export function useAudioEngine() {
     // ARENA PORT: BOTH center presses are engine-aware (resilient, pinned) —
     // the press KIND no longer decides the action; engine reality does.
     const media = mediaRef.current
-    if (press === 'play') { void play(); return }
+    if (press === 'play') {
+      // Round 20: cross-app play-echo filter. When another app's playback
+      // begins while ours is paused, iOS dispatches a pause→play PAIR to our
+      // session (device-proven 14:11 clip: the user pressed play in the
+      // YOUTUBE app; our session received pause + play the same second, and
+      // the unconditional resume made us steal the route back — YouTube
+      // lost). A play arriving right after an IGNORED pause press AND inside
+      // interruption context is that pair's second half, not user intent.
+      // A LONE play (no ignored pause in the window) stays a genuine resume —
+      // the round-8 single-tap contract is untouched.
+      const now = performance.now()
+      const pairEcho = now - lastIgnoredPausePressAtRef.current < CROSS_APP_PAIR_MS
+      const echoContext = lastExternalPauseAtRef.current > 0 && now - lastExternalPauseAtRef.current < ECHO_PRESS_WINDOW_MS
+      if (pairEcho && echoContext) {
+        addLog('cross-app play echo ignored (pause→play pair within interruption context)')
+        return
+      }
+      void play()
+      return
+    }
     // Windows freeze hold: the element is still PLAYING (muted, rate~0), so
     // Chromium derives its play/pause from the ELEMENT — overriding our
     // declared "paused" (the overlay shows || and routes the PLAY key as
@@ -666,6 +695,7 @@ export function useAudioEngine() {
       const sinceExternal = performance.now() - lastExternalPauseAtRef.current
       const echoContext = lastExternalPauseAtRef.current > 0 && sinceExternal < ECHO_PRESS_WINDOW_MS
       if (echoContext || (media && media.paused)) {
+        lastIgnoredPausePressAtRef.current = performance.now()
         addLog(`echo-gate: pause press while hidden+anchored IGNORED (echo${echoContext ? `: external pause ${Math.round(sinceExternal)}ms ago` : ': element natively paused'})`)
         return
       }
@@ -677,6 +707,12 @@ export function useAudioEngine() {
     // (a takeover killed our play). Re-anchoring a dead track would wedge —
     // concede to the other source.
     if (media && media.paused && sourceKindRef.current === 'track') {
+      // Round 20: a track element paused without our request IS external-pause
+      // evidence — stamp it NOW so a same-moment play echo (the pause→play
+      // pair) sees interruption context even before onPause has fired/logged
+      // (14:11 clip ordering: element already paused, detector logged later).
+      lastExternalPauseAtRef.current = performance.now()
+      lastIgnoredPausePressAtRef.current = lastExternalPauseAtRef.current
       addLog('remote pause ignored: element already paused (interrupted reality)')
       return
     }
