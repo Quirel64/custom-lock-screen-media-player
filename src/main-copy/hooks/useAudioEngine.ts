@@ -71,6 +71,10 @@ const ECHO_PRESS_WINDOW_MS = 10000
  *  The pair lands within the same second; 2s gives margin without swallowing a
  *  deliberate pause→resume re-press. */
 const CROSS_APP_PAIR_MS = 2000
+/** Round 21b: how long after one of OUR play initiations an element play event
+ *  is still attributed to us — must cover promise starvation lag (device-proven:
+ *  a boot play() can start the element ~2s after the press). */
+const OWN_PLAY_ECHO_MS = 5000
 /** Desktop/Windows freeze hold: element keeps playing muted at rate ~0. */
 const FROZEN_VOLUME = 0.001
 
@@ -150,6 +154,11 @@ export function useAudioEngine() {
   // interrupted reality) — a play press arriving within CROSS_APP_PAIR_MS of
   // it is iOS's cross-app pause→play pair, not user intent.
   const lastIgnoredPausePressAtRef = useRef(0)
+  // Round 21b: timestamp of our last own play initiation — the onPlaying
+  // handler attributes play events within OWN_PLAY_ECHO_MS to us; anything
+  // later, hidden, and inside interruption context is the arbiter pulling the
+  // element back (external native play) and must be conceded.
+  const lastOwnPlayAtRef = useRef(0)
   // Experiment 7 guard: the synthetic pause→play warm pair must not flip
   // store state or feed the external-pause detector.
   const warmCycleRef = useRef(false)
@@ -397,6 +406,7 @@ export function useAudioEngine() {
       if ('mediaSession' in navigator) navigator.mediaSession.playbackState = getLockPlaybackState('track')
       addLog(`pre-publish track ${getLockPlaybackState('track')} dur=${preDuration.toFixed(1)} pos=${position.toFixed(2)} rate=1`)
     }
+    lastOwnPlayAtRef.current = performance.now()
     const playPromise = media.play()
     // Dual-play only when frames are ready (maybePlayVideo): a stalled video
     // registers a frozen timeline with iOS = lock-screen seek fighting.
@@ -524,6 +534,7 @@ export function useAudioEngine() {
       publishPosition(media.duration || trackDurationRef.current, media.currentTime, 1)
       try { if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing' } catch {}
       // Resume track audio that was paused for deferred
+      lastOwnPlayAtRef.current = performance.now()
       try { await media.play() } catch (e) { addLog(`cancel deferred play failed ${e}`) }
       const vResume = videoRef.current; if (vResume && vResume.src) { try { vResume.currentTime = frozenPosRef.current } catch {}; vResume.muted = true; vResume.play().catch(() => {}) }
       return
@@ -553,6 +564,7 @@ export function useAudioEngine() {
         publishPosition(media.duration || trackDurationRef.current, resumePos, 1)
         if ('mediaSession' in navigator) navigator.mediaSession.playbackState = getLockPlaybackState('track')
         addLog(`direct resume pre-publish ${getLockPlaybackState('track')} pos=${resumePos.toFixed(2)}`)
+        lastOwnPlayAtRef.current = performance.now()
         const directPlay = media.play()
         // Gated like swaps: a stalled video start wedges a frozen timeline.
         if (isVideoResume && vResume && vResume.src) { maybePlayVideo(resumePos) }
@@ -752,7 +764,7 @@ export function useAudioEngine() {
   const handleTrackEnd = useCallback(() => {
     const { getNextTrackIndex, repeatMode } = usePlayerStore.getState()
     addLog(`ended repeat=${repeatMode}`)
-    if (repeatMode === 'one') { const m=mediaRef.current; if(m){ m.currentTime=0; frozenPosRef.current=0; setCurrentTime(0); setAudioSessionType(); m.play().catch(e=>addLog(`repeat-one failed: ${e}`)) } return }
+    if (repeatMode === 'one') { const m=mediaRef.current; if(m){ m.currentTime=0; frozenPosRef.current=0; setCurrentTime(0); setAudioSessionType(); lastOwnPlayAtRef.current = performance.now(); m.play().catch(e=>addLog(`repeat-one failed: ${e}`)) } return }
     const n = getNextTrackIndex()
     if (n !== null) { addLog(`auto-next ${n}`); nextGestureRef.current = true; setPlaying(true); setCurrentTrackIndex(n) }
     else { setPlaying(false); // freeze at end to keep session
@@ -1077,6 +1089,25 @@ export function useAudioEngine() {
     const onPlaying = () => {
       const k = sourceKindRef.current
       if (k==='track') {
+        // Round 21b: external native PLAY concession — the arbiter mirror of
+        // the external-pause detector. Device log 16:36:27: after an
+        // interruption, iOS resumed our element NATIVELY (no action dispatch,
+        // no code path — every own play() initiator is logged) to reconcile
+        // our stale 'playing' claim. That pull-back IS the steal, and the
+        // re-assert below is what makes it stick. If the element starts
+        // playing while hidden, we did not request it, and an interruption is
+        // in context — concede: pause, release the claim, never re-assert.
+        const now = performance.now()
+        const ownPlay = now - lastOwnPlayAtRef.current < OWN_PLAY_ECHO_MS
+        const externalContext = lastExternalPauseAtRef.current > 0 && now - lastExternalPauseAtRef.current < ECHO_PRESS_WINDOW_MS
+        if (!ownPlay && externalContext && document.visibilityState !== 'visible') {
+          addLog('external native play conceded (arbiter pulled the element back during interruption) — releasing claim')
+          try { media.pause() } catch { /* ignore */ }
+          setPlaying(false)
+          try { if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused' } catch {}
+          const vc = videoRef.current; if (vc && !vc.paused) try { vc.pause() } catch {}
+          return
+        }
         setOwner(k); setPlaying(true); if ('mediaSession' in navigator) navigator.mediaSession.playbackState = getLockPlaybackState('track')
         publishPosition(media.duration || trackDurationRef.current, media.currentTime, 1)
         // Ensure video reflects playing track (fix: video stuck paused after lock resume)
